@@ -22,8 +22,25 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type MapTaskDef struct {
+	FileName string
+	TaskId   int
+}
 
+// Add your RPC definitions here.
+type TaskReply struct {
+	Type         int
+	MapTask      MapTaskDef
+	ReduceTaskId int
+	NumReduce    int
+	NumMap       int
+}
+
+const (
+	Map       = 0
+	Reduce    = 1
+	Terminate = 2
+)
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

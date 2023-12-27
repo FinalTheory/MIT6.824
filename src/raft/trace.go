@@ -58,7 +58,7 @@ func TraceEventBeginEndImpl(name string, server int, timestamp int64, args map[s
 	gFile.WriteString(",\n")
 }
 
-func TraceInstant(name string, server int, timestamp int64) {
+func TraceInstant(name string, server int, timestamp int64, args map[string]any) {
 	gMutex.Lock()
 	defer gMutex.Unlock()
 	if gFile == nil {
@@ -70,6 +70,26 @@ func TraceInstant(name string, server int, timestamp int64) {
 		"pid":  0,
 		"tid":  server,
 		"ts":   timestamp - gStart,
+		"args": args,
+	}
+	data, _ := json.Marshal(logitem)
+	gFile.Write(data)
+	gFile.WriteString(",\n")
+}
+
+func TraceCounter(name string, server int, timestamp int64, args map[string]any) {
+	gMutex.Lock()
+	defer gMutex.Unlock()
+	if gFile == nil {
+		return
+	}
+	logitem := map[string]any{
+		"name": name,
+		"ph":   "C",
+		"pid":  0,
+		"tid":  server,
+		"ts":   timestamp - gStart,
+		"args": args,
 	}
 	data, _ := json.Marshal(logitem)
 	gFile.Write(data)

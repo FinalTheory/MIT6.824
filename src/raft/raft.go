@@ -82,6 +82,11 @@ type LogContainer struct {
 	data []LogEntry
 }
 
+func (c *LogContainer) Put(entry LogEntry) int {
+	c.data = append(c.data, entry)
+	return len(c.data) - 1
+}
+
 func (c *LogContainer) Length() int {
 	return len(c.data)
 }
@@ -92,7 +97,7 @@ func (c *LogContainer) LastLogIndex() int {
 
 func (c *LogContainer) LastLogTerm() int {
 	if c.Length() == 0 {
-		return 0
+		return -1
 	} else {
 		return c.Get(c.Length() - 1).Term
 	}
@@ -125,8 +130,11 @@ type Raft struct {
 	voteCount   int
 	currentTerm int
 	commitIndex int
+	lastApplied int
 
-	cond *sync.Cond
+	nextIndex  []int
+	matchIndex []int
+	cond       *sync.Cond
 
 	log LogContainer
 
@@ -245,7 +253,7 @@ func MoreOrEqualUpToDateThan(lhs LastLogInfo, rhs LastLogInfo) bool {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.HandleResponseTermLocked(args.Term)
+	rf.HandleTermLocked(args.Term)
 	reply.Term = rf.currentTerm
 	// candidate's term is valid
 	if args.Term >= rf.currentTerm {
@@ -253,6 +261,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if MoreOrEqualUpToDateThan(LastLogInfo{index: args.LastLogIndex, term: args.LastLogTerm}, rf.GetLastLogInfoLocked()) {
 				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
+				rf.lastReceivedRPC = time.Now().UnixMilli()
+				TraceInstant("Vote", rf.me, time.Now().UnixMicro(), map[string]any{"voteFor": args.CandidateId, "term": rf.currentTerm})
 				return
 			}
 		}
@@ -263,7 +273,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.HandleResponseTermLocked(args.Term)
+	if len(args.Entries) == 0 {
+		TraceInstant("Heartbeat", rf.me, time.Now().UnixMicro(), map[string]any{
+			"from":        args.LeaderId,
+			"term":        args.Term,
+			"currentTerm": rf.currentTerm,
+		})
+	}
+	rf.HandleTermLocked(args.Term)
+	// only update timestamp when receiving RPC from current leader
+	if args.Term == rf.currentTerm {
+		rf.lastReceivedRPC = time.Now().UnixMilli()
+	}
 	reply.Success = true
 	reply.Term = rf.currentTerm
 }
@@ -320,9 +341,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	_, isLeader := rf.GetState()
+	if !isLeader || rf.killed() {
+		return index, term, false
+	}
 
-	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index = rf.log.Put(LogEntry{Term: rf.currentTerm, Command: command})
+	term = rf.currentTerm
 
 	return index, term, isLeader
 }
@@ -370,12 +398,14 @@ func (rf *Raft) TryStartNewElection() {
 		return
 	}
 	rf.currentTerm += 1
+	TraceInstant("NewElection", rf.me, time.Now().UnixMicro(), map[string]any{"currentTerm": rf.currentTerm})
 	rf.SwitchToCandidate()
 	info := rf.GetLastLogInfoLocked()
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// request for vote in parallel
-			go rf.RequestVoteFromServer(i, info)
+			go rf.RequestVoteFromServer(i, info, rf.currentTerm)
 		}
 	}
 }
@@ -384,15 +414,13 @@ func (rf *Raft) GetLastLogInfoLocked() LastLogInfo {
 	return LastLogInfo{index: rf.log.LastLogIndex(), term: rf.log.LastLogTerm()}
 }
 
-func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo) {
-	rf.mu.Lock()
+func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
 	arg := RequestVoteArgs{
-		Term:         rf.currentTerm,
+		Term:         term,
 		CandidateId:  rf.me,
 		LastLogIndex: info.index,
 		LastLogTerm:  info.term,
 	}
-	rf.mu.Unlock()
 	reply := RequestVoteReply{}
 	for {
 		if rf.sendRequestVote(server, &arg, &reply) {
@@ -404,7 +432,7 @@ func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo) {
 	defer rf.mu.Unlock()
 	// ignore the response if already in next term
 	ignoreResponse := arg.Term != rf.currentTerm
-	rf.HandleResponseTermLocked(reply.Term)
+	rf.HandleTermLocked(reply.Term)
 	if !ignoreResponse && reply.VoteGranted {
 		rf.HandleVoteGrantedLocked()
 	}
@@ -416,7 +444,7 @@ func (rf *Raft) SwitchToCandidate() {
 		panic("Leader can not become candidate")
 	}
 	if rf.role == Follower {
-		TraceEventEnd(!rf.killed(), Follower.String(), rf.me, now, rf.GetTraceState())
+		TraceEventEnd(!rf.killed(), Follower.String(), rf.me, now, nil)
 	}
 	if rf.role != Candidate {
 		TraceEventBegin(!rf.killed(), Candidate.String(), rf.me, now, rf.GetTraceState())
@@ -429,10 +457,10 @@ func (rf *Raft) SwitchToCandidate() {
 func (rf *Raft) SwitchToFollower() {
 	now := time.Now().UnixMicro()
 	if rf.role == Leader {
-		TraceEventEnd(!rf.killed(), Leader.String(), rf.me, now, rf.GetTraceState())
+		TraceEventEnd(!rf.killed(), Leader.String(), rf.me, now, nil)
 	}
 	if rf.role == Candidate {
-		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, now, rf.GetTraceState())
+		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, now, nil)
 	}
 	if rf.role != Follower {
 		TraceEventBegin(!rf.killed(), Follower.String(), rf.me, now, rf.GetTraceState())
@@ -447,15 +475,14 @@ func (rf *Raft) SwitchToLeader() {
 		panic("Follower can not become leader")
 	}
 	now := time.Now().UnixMicro()
+	if rf.role == Candidate {
+		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, now, nil)
+	}
 	state := rf.GetTraceState()
 	state["voteCount"] = rf.voteCount
-	if rf.role == Candidate {
-		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, now, state)
-	}
 	TraceEventBegin(!rf.killed(), Leader.String(), rf.me, now, state)
 	rf.role = Leader
 	rf.voteCount = 0
-	rf.votedFor = Null
 	rf.cond.Signal()
 }
 
@@ -489,9 +516,7 @@ func (rf *Raft) SendHeartBeatImpl() {
 	}
 }
 
-func (rf *Raft) HandleResponseTermLocked(term int) {
-	// this method will be called on every RPC, thus we update the timestamp here
-	rf.lastReceivedRPC = time.Now().UnixMilli()
+func (rf *Raft) HandleTermLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.SwitchToFollower()
@@ -525,7 +550,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	if me == 0 {
 		InitNewTrace()
-		TraceInstant("Start", 0, time.Now().UnixMicro())
+		TraceInstant("Start", 0, time.Now().UnixMicro(), nil)
 	}
 	TraceEventBegin(true, "Follower", me, time.Now().UnixMicro(), nil)
 	rf := &Raft{}
@@ -541,6 +566,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 	rf.votedFor = Null
 	rf.cond = sync.NewCond(&rf.mu)
+
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i += 1 {
+		rf.nextIndex[i] = 0
+		rf.matchIndex[i] = -1
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

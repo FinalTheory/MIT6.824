@@ -316,7 +316,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		TraceInstant(eventName, rf.me, time.Now().UnixMicro(), map[string]any{
 			"prevLogIndex": args.PrevLogIndex,
 			"prevLogTerm":  args.PrevLogTerm,
-			"entriesSize":  len(args.Entries),
+			"entries":      fmt.Sprintf("%v", args.Entries),
 			"term":         args.Term,
 			"from":         args.LeaderId,
 			"success":      reply.Success,
@@ -334,8 +334,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+
 	// PrevLogIndex = PrevLogTerm = -1 when leader log is empty
-	// thus we only compare the term when both leader and follower logs are non-empty
 	if !rf.log.IsEmpty() && args.PrevLogIndex != -1 {
 		if args.PrevLogIndex < rf.log.Length() {
 			if rf.log.Get(args.PrevLogIndex).Term != args.PrevLogTerm {
@@ -347,6 +347,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			return
 		}
+	} else if rf.log.IsEmpty() && args.PrevLogIndex != -1 {
+		reply.Success = false
+		return
+	} else if !rf.log.IsEmpty() && args.PrevLogIndex == -1 {
+		// we'll later truncate our logs
+	} else if rf.log.IsEmpty() && args.PrevLogIndex == -1 {
+		// we'll simply append logs later
 	}
 
 	rf.AppendNewEntriesLocked(args)
@@ -557,8 +564,17 @@ func (rf *Raft) ApplyEntryLocked() {
 	if rf.lastApplied == rf.commitIndex {
 		return
 	}
-	lastApplied := rf.lastApplied
 	entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
+		entries = append(entries, rf.log.Get(i))
+	}
+	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), map[string]any{
+		"inclusiveStart": rf.lastApplied + 1,
+		"inclusiveEnd":   rf.commitIndex,
+		"logSize":        rf.log.Length(),
+		"currentTerm":    rf.currentTerm,
+		"entries":        fmt.Sprintf("%v", entries),
+	})
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
 		*rf.applyCh <- ApplyMsg{
 			CommandValid: true,
@@ -566,16 +582,7 @@ func (rf *Raft) ApplyEntryLocked() {
 			CommandIndex: i + 1,
 		}
 		rf.lastApplied = i
-		entries = append(entries, rf.log.Get(i))
 	}
-	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), map[string]any{
-		"inclusiveStart": lastApplied + 1,
-		"inclusiveEnd":   rf.commitIndex,
-		"logSize":        rf.log.Length(),
-		"currentTerm":    rf.currentTerm,
-		"commitIndex":    rf.commitIndex,
-		"entries":        fmt.Sprintf("%v", entries),
-	})
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,

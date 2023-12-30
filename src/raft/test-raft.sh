@@ -12,7 +12,8 @@ trap 'kill -INT -$pid; exit 1' INT
 runs=$1
 
 for i in $(seq 1 $runs); do
-    timeout -k 2s 900s go test -run 2A &
+    rm -fr *.json*
+    timeout -k 2s 900s go test -run 2B &
     pid=$!
     if ! wait $pid; then
         echo '***' FAILED TESTS IN TRIAL $i

@@ -168,7 +168,6 @@ type Raft struct {
 	nextIndex         []int
 	matchIndex        []int
 	condAppendEntries []*sync.Cond
-	shouldHeartbeat   []atomic.Bool
 
 	log LogContainer
 
@@ -465,33 +464,36 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.log.Put(LogEntry{Term: rf.currentTerm, Command: command})
 	term = rf.currentTerm
 	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before SendLogDaemon blocked on wait.
-	rf.SignalSendEntries(false)
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			rf.condAppendEntries[i].Signal()
+		}
+	}
 	return index, term, isLeader
 }
 
-func (rf *Raft) ShouldSendEntriesToServerLocked(server int) bool {
+func (rf *Raft) ShouldSendEntriesToServerLocked(server int, isHeartBeat bool) bool {
 	if rf.role != Leader {
 		return false
 	}
-	return rf.log.Length() > rf.nextIndex[server] || rf.shouldHeartbeat[server].Load()
+	return rf.log.Length() > rf.nextIndex[server] || isHeartBeat
 }
 
 func (rf *Raft) SendLogDaemon(server int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for !rf.ShouldSendEntriesToServerLocked(server) {
+		for !rf.ShouldSendEntriesToServerLocked(server, false) {
 			rf.condAppendEntries[server].Wait()
 		}
 		rf.mu.Unlock()
-		rf.SendLogEntriesToServer(server)
+		rf.SendLogEntriesToServer(server, false)
 	}
 }
 
-func (rf *Raft) SendLogEntriesToServer(server int) {
+func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
 	for {
 		rf.mu.Lock()
-		// each time we prepare parameters, should re-eval if we really need to send entries
-		if !rf.ShouldSendEntriesToServerLocked(server) {
+		if !rf.ShouldSendEntriesToServerLocked(server, isHeartBeat) {
 			rf.mu.Unlock()
 			return
 		}
@@ -506,17 +508,15 @@ func (rf *Raft) SendLogEntriesToServer(server int) {
 		entries := rf.log.SliceFrom(nextIndex)
 		copiedEntries := make([]LogEntry, len(entries))
 		copy(copiedEntries, entries)
-		// now we will send heartbeat, clear the flag
-		rf.shouldHeartbeat[server].Store(false)
 		rf.mu.Unlock()
 
-		if rf.SendLogEntriesImpl(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) {
+		if rf.SendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) || isHeartBeat {
 			break
 		}
 	}
 }
 
-func (rf *Raft) SendLogEntriesImpl(server int, term int, commitIndex int, entries []LogEntry, prevLogIndex int, prevLogTerm int, nextIndex int) bool {
+func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entries []LogEntry, prevLogIndex int, prevLogTerm int, nextIndex int) bool {
 	reply := AppendEntriesReply{}
 	args := AppendEntriesArgs{
 		Term:         term,
@@ -526,10 +526,10 @@ func (rf *Raft) SendLogEntriesImpl(server int, term int, commitIndex int, entrie
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 	}
-	for {
-		if rf.sendAppendEntries(server, &args, &reply) {
-			break
-		}
+	if !rf.sendAppendEntries(server, &args, &reply) {
+		// sleep for a while if RPC itself failed
+		time.Sleep(time.Millisecond * 10)
+		return false
 	}
 
 	rf.mu.Lock()
@@ -747,22 +747,23 @@ func (rf *Raft) SwitchToLeader() {
 		rf.nextIndex[i] = rf.log.Length()
 		rf.matchIndex[i] = -1
 	}
-	rf.SignalSendEntries(true)
-}
-
-func (rf *Raft) SignalSendEntries(isHeartbeat bool) {
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			rf.shouldHeartbeat[i].Store(isHeartbeat)
-			rf.condAppendEntries[i].Signal()
-		}
-	}
+	rf.heartbeatImpl()
 }
 
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		time.Sleep(100 * time.Millisecond)
-		rf.SignalSendEntries(true)
+		if _, isLeader := rf.GetState(); isLeader {
+			rf.heartbeatImpl()
+		}
+	}
+}
+
+func (rf *Raft) heartbeatImpl() {
+	for i := 0; i < len(rf.peers); i += 1 {
+		if i != rf.me {
+			go rf.SendLogEntriesToServer(i, true)
+		}
 	}
 }
 
@@ -817,10 +818,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 	rf.votedFor = Null
 	rf.condAppendEntries = make([]*sync.Cond, len(rf.peers))
-	rf.shouldHeartbeat = make([]atomic.Bool, len(rf.peers))
 	for i := 0; i < len(rf.peers); i += 1 {
 		rf.condAppendEntries[i] = sync.NewCond(&rf.mu)
-		rf.shouldHeartbeat[i].Store(false)
 	}
 
 	rf.commitIndex = -1

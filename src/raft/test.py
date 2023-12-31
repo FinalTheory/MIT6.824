@@ -6,7 +6,20 @@ defaults = ["Leader", "Follower", "Candidate", "End"]
 
 
 def work(fname, events):
+    entries = [s for s in events if s.isdigit()]
     results = []
+    def filter_by_entry(item):
+        if len(entries) == 0:
+            return True
+        if "args" not in item or item["args"] is None:
+            return True
+        if "entries" not in item["args"] and "entry" not in item["args"]:
+            return True
+        for e in entries:
+            if e in json.dumps(item):
+                return True
+        return False
+
     with open(fname, "r") as f:
         data = f.read()
         try:
@@ -17,7 +30,7 @@ def work(fname, events):
             data += "]"
             js = json.loads(data)
         for item in js:
-            if item["name"].lower() in events:
+            if item["name"].lower() in events and filter_by_entry(item):
                 results.append(item)
         if js[-1]["name"] != "End":
             results.append(

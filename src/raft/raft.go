@@ -319,6 +319,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			"entries":      fmt.Sprintf("%v", args.Entries),
 			"term":         args.Term,
 			"from":         args.LeaderId,
+			"leaderCommit": args.LeaderCommit,
 			"success":      reply.Success,
 			"currentTerm":  rf.currentTerm,
 			"logSize":      rf.log.Length(),
@@ -361,8 +362,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 		// when PrevLogIndex == -1 and args.Entries empty, we simply reset commitIndex to its default value -1
-		rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
-		rf.ApplyEntryLocked()
+		newCommitIndex := min(args.LeaderCommit, lastNewEntryIndex)
+		if newCommitIndex > rf.commitIndex {
+			rf.commitIndex = newCommitIndex
+			rf.ApplyEntryLocked()
+		}
 	}
 
 	reply.Success = true
@@ -530,16 +534,34 @@ func (rf *Raft) SendLogEntriesImpl(server int, term int, commitIndex int, entrie
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	foundNewTerm := rf.HandleTermUpdateLocked(reply.Term)
+	ignoreResponse := rf.currentTerm != args.Term
+	rf.HandleTermUpdateLocked(reply.Term)
+	if ignoreResponse {
+		// drop the reply and return if term mismatch
+		// we should no longer try to send entries
+		return true
+	}
+
 	if reply.Success {
 		rf.nextIndex[server] = max(nextIndex+len(entries), rf.nextIndex[server])
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
 	} else {
+		termOutDated := args.Term < reply.Term
 		// we only decrement nextIndex if AppendEntries fails because of log inconsistency
-		if !foundNewTerm {
+		if !termOutDated {
 			// replicate should finally succeed when nextIndex == 0, unless currentTerm is out-dated
 			rf.nextIndex[server] = min(nextIndex-1, rf.nextIndex[server])
+			// TODO: remove this
 			if rf.nextIndex[server] < 0 {
+				TraceInstant("Unexpected", rf.me, time.Now().UnixMicro(), map[string]any{
+					"args":        fmt.Sprintf("%+v", args),
+					"reply":       fmt.Sprintf("%+v", reply),
+					"nextIndex":   rf.nextIndex[server],
+					"matchIndex":  rf.matchIndex[server],
+					"currentTerm": rf.currentTerm,
+					"commitIndex": rf.commitIndex,
+					"lastApplied": rf.lastApplied,
+				})
 				panic("Unexpected rf.nextIndex[server] < 0")
 			}
 		}
@@ -723,7 +745,7 @@ func (rf *Raft) SwitchToLeader() {
 	rf.voteCount = 0
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.log.Length()
-		rf.matchIndex[i] = rf.log.Length() - 1
+		rf.matchIndex[i] = -1
 	}
 	rf.SignalSendEntries(true)
 }
@@ -744,13 +766,11 @@ func (rf *Raft) heartbeat() {
 	}
 }
 
-func (rf *Raft) HandleTermUpdateLocked(term int) bool {
+func (rf *Raft) HandleTermUpdateLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.SwitchToFollower()
-		return true
 	}
-	return false
 }
 
 func (rf *Raft) HandleVoteGrantedLocked() {

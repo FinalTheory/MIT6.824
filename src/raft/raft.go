@@ -530,16 +530,18 @@ func (rf *Raft) SendLogEntriesImpl(server int, term int, commitIndex int, entrie
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.HandleTermUpdateLocked(reply.Term)
+	foundNewTerm := rf.HandleTermUpdateLocked(reply.Term)
 	if reply.Success {
 		rf.nextIndex[server] = max(nextIndex+len(entries), rf.nextIndex[server])
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
 	} else {
-		// replicate should finally succeed when nextIndex == 0, unless currentTerm is out-dated
-		rf.nextIndex[server] = min(nextIndex-1, rf.nextIndex[server])
-		// in which case we simply reset it to 0
-		if rf.nextIndex[server] < 0 {
-			rf.nextIndex[server] = 0
+		// we only decrement nextIndex if AppendEntries fails because of log inconsistency
+		if !foundNewTerm {
+			// replicate should finally succeed when nextIndex == 0, unless currentTerm is out-dated
+			rf.nextIndex[server] = min(nextIndex-1, rf.nextIndex[server])
+			if rf.nextIndex[server] < 0 {
+				panic("Unexpected rf.nextIndex[server] < 0")
+			}
 		}
 		return false
 	}
@@ -742,11 +744,13 @@ func (rf *Raft) heartbeat() {
 	}
 }
 
-func (rf *Raft) HandleTermUpdateLocked(term int) {
+func (rf *Raft) HandleTermUpdateLocked(term int) bool {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.SwitchToFollower()
+		return true
 	}
+	return false
 }
 
 func (rf *Raft) HandleVoteGrantedLocked() {

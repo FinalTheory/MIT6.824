@@ -357,7 +357,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.AppendNewEntriesLocked(args)
-	rf.CommitLogsLocked(args.LeaderCommit)
+	// commit the new logs
+	if args.LeaderCommit > rf.commitIndex {
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		// when PrevLogIndex == -1 and args.Entries empty, we simply reset commitIndex to its default value -1
+		rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
+		rf.ApplyEntryLocked()
+	}
 
 	reply.Success = true
 }
@@ -383,14 +389,6 @@ func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
 	}
 	// append remaining entries into log
 	rf.log.Append(args.Entries[i:])
-}
-
-func (rf *Raft) CommitLogsLocked(leaderCommit int) {
-	// commit the new logs
-	if leaderCommit > rf.commitIndex {
-		rf.commitIndex = min(leaderCommit, rf.log.Length()-1)
-		rf.ApplyEntryLocked()
-	}
 }
 
 // example code to send a RequestVote RPC to a server.

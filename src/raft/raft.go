@@ -452,6 +452,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	TraceInstant("StartCommand", rf.me, time.Now().UnixMicro(), map[string]any{
+		"logSize":     rf.log.Length(),
+		"currentTerm": rf.currentTerm,
+		"commitIndex": rf.commitIndex,
+		"lastApplied": rf.lastApplied,
+		"entry":       fmt.Sprintf("%v", command),
+	})
+
 	index = rf.log.Put(LogEntry{Term: rf.currentTerm, Command: command})
 	term = rf.currentTerm
 	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before SendLogDaemon blocked on wait.
@@ -622,6 +630,7 @@ func (rf *Raft) TryStartNewElection() {
 	if time.Now().UnixMilli()-rf.lastReceivedRPC <= rf.electionTimeout {
 		return
 	}
+	rf.lastReceivedRPC = time.Now().UnixMilli()
 	// do nothing if already leader
 	if rf.role == Leader {
 		return

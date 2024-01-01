@@ -291,11 +291,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// candidate's term is valid
 	if args.Term >= rf.currentTerm {
 		if rf.votedFor == args.CandidateId || rf.votedFor == Null {
-			if MoreOrEqualUpToDateThan(LastLogInfo{index: args.LastLogIndex, term: args.LastLogTerm}, rf.GetLastLogInfoLocked()) {
+			candidateLastLogInfo := LastLogInfo{index: args.LastLogIndex, term: args.LastLogTerm}
+			if MoreOrEqualUpToDateThan(candidateLastLogInfo, rf.GetLastLogInfoLocked()) {
 				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
 				rf.lastReceivedRPC = time.Now().UnixMilli()
-				TraceInstant("Vote", rf.me, time.Now().UnixMicro(), map[string]any{"voteFor": args.CandidateId, "term": rf.currentTerm})
+				TraceInstant("Vote", rf.me, time.Now().UnixMicro(), map[string]any{
+					"voteFor":              args.CandidateId,
+					"term":                 rf.currentTerm,
+					"selfLastLogInfo":      fmt.Sprintf("%v", rf.GetLastLogInfoLocked()),
+					"candidateLastLogInfo": fmt.Sprintf("%v", candidateLastLogInfo),
+				})
 				return
 			}
 		}
@@ -446,13 +452,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	_, isLeader := rf.GetState()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader := rf.role == Leader
 	if !isLeader || rf.killed() {
 		return index, term, false
 	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	TraceInstant("StartCommand", rf.me, time.Now().UnixMicro(), map[string]any{
 		"logSize":     rf.log.Length(),
 		"currentTerm": rf.currentTerm,
@@ -460,7 +465,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		"lastApplied": rf.lastApplied,
 		"entry":       fmt.Sprintf("%v", command),
 	})
-
 	index = rf.log.Put(LogEntry{Term: rf.currentTerm, Command: command})
 	term = rf.currentTerm
 	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before SendLogDaemon blocked on wait.

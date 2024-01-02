@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -32,6 +31,20 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -164,12 +177,17 @@ type Raft struct {
 
 	nextIndex         []int
 	matchIndex        []int
-	condAppendEntries []*sync.Cond
+	condAppendEntries *sync.Cond
 
 	log LogContainer
 
 	lastReceivedRPC int64
 	electionTimeout int64
+	wakeTime        int64
+
+	tickerKilled    atomic.Bool
+	heartbeatKilled atomic.Bool
+	daemonKilled    []atomic.Bool
 }
 
 // return currentTerm and whether this server
@@ -339,6 +357,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	if args.Term == rf.currentTerm && rf.role == Candidate {
+		rf.SwitchToFollower()
+	}
 
 	// PrevLogIndex = PrevLogTerm = -1 when leader log is empty
 	if !rf.log.IsEmpty() && args.PrevLogIndex != -1 {
@@ -489,16 +510,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.log.Put(LogEntry{Term: rf.currentTerm, Command: command})
 	term = rf.currentTerm
 	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before SendLogDaemon blocked on wait.
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			rf.condAppendEntries[i].Signal()
-		}
-	}
+	rf.condAppendEntries.Broadcast()
 	rf.persist()
 	return index, term, isLeader
 }
 
 func (rf *Raft) ShouldSendEntriesToServerLocked(server int, isHeartBeat bool) bool {
+	if rf.killed() {
+		return false
+	}
 	if rf.role != Leader {
 		return false
 	}
@@ -508,12 +528,13 @@ func (rf *Raft) ShouldSendEntriesToServerLocked(server int, isHeartBeat bool) bo
 func (rf *Raft) SendLogDaemon(server int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for !rf.ShouldSendEntriesToServerLocked(server, false) {
-			rf.condAppendEntries[server].Wait()
+		for !rf.ShouldSendEntriesToServerLocked(server, false) && !rf.killed() {
+			rf.condAppendEntries.Wait()
 		}
 		rf.mu.Unlock()
 		rf.SendLogEntriesToServer(server, false)
 	}
+	rf.daemonKilled[server].Store(true)
 }
 
 func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
@@ -536,8 +557,11 @@ func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
 		copy(copiedEntries, entries)
 		rf.mu.Unlock()
 
-		if rf.SendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) || isHeartBeat {
+		if rf.SendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) || isHeartBeat || rf.killed() {
 			break
+		} else {
+			// sleep for a while if RPC failed
+			time.Sleep(time.Millisecond * 10)
 		}
 	}
 }
@@ -553,8 +577,6 @@ func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entrie
 		PrevLogTerm:  prevLogTerm,
 	}
 	if !rf.sendAppendEntries(server, &args, &reply) {
-		// sleep for a while if RPC itself failed
-		time.Sleep(time.Millisecond * 10)
 		return false
 	}
 
@@ -662,6 +684,21 @@ func (rf *Raft) ApplyEntryLocked() {
 	}
 }
 
+func (rf *Raft) CheckKillComplete() bool {
+	if !rf.tickerKilled.Load() {
+		return false
+	}
+	if !rf.heartbeatKilled.Load() {
+		return false
+	}
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me && !rf.daemonKilled[i].Load() {
+			return false
+		}
+	}
+	return true
+}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -673,6 +710,16 @@ func (rf *Raft) ApplyEntryLocked() {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.condAppendEntries.Broadcast()
+	go func(start int64) {
+		for !rf.CheckKillComplete() {
+			time.Sleep(time.Millisecond * 100)
+			timeout := int64(10)
+			if time.Now().UnixMilli()-start > timeout*1000 {
+				log.Printf("Spent more than %ds to kill %p", timeout, rf)
+			}
+		}
+	}(time.Now().UnixMilli())
 }
 
 func (rf *Raft) killed() bool {
@@ -686,14 +733,17 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		rf.electionTimeout = 200 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(rf.electionTimeout) * time.Millisecond)
-
 		// Check if a leader election should be started.
 		// this holds true on start
 		rf.TryStartNewElection()
 	}
+	rf.tickerKilled.Store(true)
 }
 
 func (rf *Raft) TryStartNewElection() {
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if time.Now().UnixMilli()-rf.lastReceivedRPC <= rf.electionTimeout {
@@ -730,10 +780,8 @@ func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
 		LastLogTerm:  info.term,
 	}
 	reply := RequestVoteReply{}
-	for {
-		if rf.sendRequestVote(server, &arg, &reply) {
-			break
-		}
+	if !rf.sendRequestVote(server, &arg, &reply) {
+		return
 	}
 	// lock Data and handle logic
 	rf.mu.Lock()
@@ -807,6 +855,7 @@ func (rf *Raft) heartbeat() {
 			rf.heartbeatImpl()
 		}
 	}
+	rf.heartbeatKilled.Store(true)
 }
 
 func (rf *Raft) heartbeatImpl() {
@@ -849,10 +898,6 @@ func (rf *Raft) MajorityNum() int {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	if me == 0 {
-		InitNewTrace()
-		TraceInstant("Start", 0, time.Now().UnixMicro(), nil)
-	}
 	TraceEventBegin(true, "Follower", me, time.Now().UnixMicro(), nil)
 	rf := &Raft{}
 	rf.applyCh = &applyCh
@@ -867,15 +912,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.voteCount = 0
 	rf.votedFor = Null
-	rf.condAppendEntries = make([]*sync.Cond, len(rf.peers))
-	for i := 0; i < len(rf.peers); i += 1 {
-		rf.condAppendEntries[i] = sync.NewCond(&rf.mu)
-	}
+	rf.condAppendEntries = sync.NewCond(&rf.mu)
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.daemonKilled = make([]atomic.Bool, len(rf.peers))
 	for i := 0; i < len(rf.peers); i += 1 {
 		rf.nextIndex[i] = 0
 		rf.matchIndex[i] = -1

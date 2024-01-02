@@ -18,7 +18,11 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"fmt"
+	"log"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -80,25 +84,25 @@ type LogEntry struct {
 }
 
 type LogContainer struct {
-	data []LogEntry
+	Data []LogEntry
 }
 
 func (c *LogContainer) Put(entry LogEntry) int {
-	c.data = append(c.data, entry)
-	return len(c.data)
+	c.Data = append(c.Data, entry)
+	return len(c.Data)
 }
 
 func (c *LogContainer) Append(entry []LogEntry) int {
-	c.data = append(c.data, entry...)
-	return len(c.data) - 1
+	c.Data = append(c.Data, entry...)
+	return len(c.Data) - 1
 }
 
 func (c *LogContainer) Length() int {
-	return len(c.data)
+	return len(c.Data)
 }
 
 func (c *LogContainer) LastLogIndex() int {
-	return len(c.data) - 1
+	return len(c.Data) - 1
 }
 
 func (c *LogContainer) LastLogTerm() int {
@@ -113,11 +117,11 @@ func (c *LogContainer) SliceFrom(start int) []LogEntry {
 	if start > c.Length() {
 		panic("Invalid slice start")
 	}
-	return c.data[start:]
+	return c.Data[start:]
 }
 
 func (c *LogContainer) TruncateTo(to int) {
-	c.data = c.data[:to]
+	c.Data = c.Data[:to]
 }
 
 func (rf *Raft) GetTraceState() map[string]any {
@@ -132,18 +136,11 @@ func (c *LogContainer) Get(index int) LogEntry {
 	if index >= c.Length() {
 		panic(fmt.Sprintf("Invalid get index %d", index))
 	}
-	return c.data[index]
-}
-
-func (c *LogContainer) Set(index int, entry LogEntry) {
-	if index >= c.Length() {
-		panic("Invalid set index.")
-	}
-	c.data[index] = entry
+	return c.Data[index]
 }
 
 func (c *LogContainer) IsEmpty() bool {
-	return len(c.data) == 0
+	return len(c.Data) == 0
 }
 
 // A Go object implementing a single Raft peer.
@@ -155,7 +152,7 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh   *chan ApplyMsg
 
-	// Your data here (2A, 2B, 2C).
+	// Your Data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	role        Role
@@ -193,14 +190,19 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	if err := e.Encode(rf.log); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(rf.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(rf.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	state := buf.Bytes()
+	rf.persister.Save(state, nil)
 }
 
 // restore previously persisted state.
@@ -208,19 +210,14 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var votedFor, currentTerm int
+	if d.Decode(&rf.log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
+		panic("Failed to reload persisted state.")
+	}
+	rf.votedFor = votedFor
+	rf.currentTerm = currentTerm
 }
 
 // the service says it has created a snapshot that has
@@ -258,8 +255,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term                int
+	Success             bool
+	XTerm, XIndex, XLen int
 }
 
 type LastLogInfo struct {
@@ -302,6 +300,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					"selfLastLogInfo":      fmt.Sprintf("%v", rf.GetLastLogInfoLocked()),
 					"candidateLastLogInfo": fmt.Sprintf("%v", candidateLastLogInfo),
 				})
+				rf.persist()
 				return
 			}
 		}
@@ -344,18 +343,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// PrevLogIndex = PrevLogTerm = -1 when leader log is empty
 	if !rf.log.IsEmpty() && args.PrevLogIndex != -1 {
 		if args.PrevLogIndex < rf.log.Length() {
-			if rf.log.Get(args.PrevLogIndex).Term != args.PrevLogTerm {
+			term := rf.log.Get(args.PrevLogIndex).Term
+			// find the first log entry index with the mismatch term
+			if term != args.PrevLogTerm {
+				reply.XTerm = term
+				for i := args.PrevLogIndex; i >= 0; i -= 1 {
+					if rf.log.Get(i).Term == term {
+						reply.XIndex = i
+					}
+				}
+				reply.XLen = rf.log.Length()
 				reply.Success = false
 				return
 			}
 		} else {
 			// also return false if we don't find PrevLogIndex in own log
-			reply.Success = false
-			return
+			goto failed
 		}
 	} else if rf.log.IsEmpty() && args.PrevLogIndex != -1 {
-		reply.Success = false
-		return
+		goto failed
 	} else if !rf.log.IsEmpty() && args.PrevLogIndex == -1 {
 		// we'll later truncate our logs
 	} else if rf.log.IsEmpty() && args.PrevLogIndex == -1 {
@@ -373,12 +379,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.ApplyEntryLocked()
 		}
 	}
-
 	reply.Success = true
+	return
+failed:
+	reply.XLen = rf.log.Length()
+	reply.XTerm = -1
+	reply.XIndex = -1
+	reply.Success = false
+	return
 }
 
 func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
 	// check if we need to truncate invalid log entries
+	logUpdated := false
 	truncateTo := -1
 	i := 0
 	for ; i < len(args.Entries); i++ {
@@ -395,9 +408,17 @@ func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
 	}
 	if truncateTo != -1 {
 		rf.log.TruncateTo(truncateTo)
+		logUpdated = true
 	}
 	// append remaining entries into log
-	rf.log.Append(args.Entries[i:])
+	newEntries := args.Entries[i:]
+	if len(newEntries) != 0 {
+		logUpdated = true
+	}
+	rf.log.Append(newEntries)
+	if logUpdated {
+		rf.persist()
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -473,6 +494,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.condAppendEntries[i].Signal()
 		}
 	}
+	rf.persist()
 	return index, term, isLeader
 }
 
@@ -552,27 +574,48 @@ func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entrie
 	} else {
 		termOutDated := args.Term < reply.Term
 		// we only decrement nextIndex if AppendEntries fails because of log inconsistency
+		// replicate should finally succeed when nextIndex == 0, unless currentTerm is out-dated
 		if !termOutDated {
-			// replicate should finally succeed when nextIndex == 0, unless currentTerm is out-dated
-			rf.nextIndex[server] = min(nextIndex-1, rf.nextIndex[server])
-			// TODO: remove this
-			if rf.nextIndex[server] < 0 {
-				TraceInstant("Unexpected", rf.me, time.Now().UnixMicro(), map[string]any{
-					"args":        fmt.Sprintf("%+v", args),
-					"reply":       fmt.Sprintf("%+v", reply),
-					"nextIndex":   rf.nextIndex[server],
-					"matchIndex":  rf.matchIndex[server],
-					"currentTerm": rf.currentTerm,
-					"commitIndex": rf.commitIndex,
-					"lastApplied": rf.lastApplied,
-				})
-				panic("Unexpected rf.nextIndex[server] < 0")
-			}
+			rf.HandleNextIndexBacktrackLocked(server, &args, &reply)
 		}
 		return false
 	}
 	rf.UpdateCommitIndexLocked()
 	return true
+}
+
+func (rf *Raft) FindTermInLogLocked(start int, term int) int {
+	for i := start; i >= 0; i -= 1 {
+		if rf.log.Get(i).Term == term {
+			return i
+		}
+	}
+	return -1
+}
+
+func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if reply.XTerm == -1 {
+		rf.nextIndex[server] = reply.XLen
+	} else {
+		// check if the conflict term in follower also exists in leader
+		// and return the last log entry index of the term
+		idx := rf.FindTermInLogLocked(args.PrevLogIndex, reply.XTerm)
+		if idx == -1 {
+			// mismatch term not in leader log, we're safe to skip the entire mismatch term in follower log
+			rf.nextIndex[server] = reply.XIndex
+		} else {
+			// if found, we know at least to some index before PrevLogIndex in the term, the follower has matching logs with leader
+			// if we skip this entire term in leader's log, we're skipping too much
+			// thus we resend the last entry in the term and see if we could succeed
+			// e.g.
+			// leader:   1 1 1 2 2
+			// follower: 1 1 1 1
+			// if leader send the last entry with term `2` to follower, it will fail because previous log term mismatch (2 != 1)
+			// but it will be step back too much if we skip the term 1 entirely
+			// thus we retry with the last entry with term 1 in leader log, and we can expect it's likely succeed
+			rf.nextIndex[server] = idx
+		}
+	}
 }
 
 func (rf *Raft) UpdateCommitIndexLocked() {
@@ -661,6 +704,7 @@ func (rf *Raft) TryStartNewElection() {
 	if rf.role == Leader {
 		return
 	}
+	// it will be persisted during switch to candidate
 	rf.currentTerm += 1
 	TraceInstant("NewElection", rf.me, time.Now().UnixMicro(), map[string]any{"currentTerm": rf.currentTerm})
 	rf.SwitchToCandidate()
@@ -691,7 +735,7 @@ func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
 			break
 		}
 	}
-	// lock data and handle logic
+	// lock Data and handle logic
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// ignore the response if already in next term
@@ -716,6 +760,7 @@ func (rf *Raft) SwitchToCandidate() {
 	rf.role = Candidate
 	rf.voteCount = 1
 	rf.votedFor = rf.me
+	rf.persist()
 }
 
 func (rf *Raft) SwitchToFollower() {
@@ -732,6 +777,7 @@ func (rf *Raft) SwitchToFollower() {
 	rf.role = Follower
 	rf.voteCount = 0
 	rf.votedFor = Null
+	rf.persist()
 }
 
 func (rf *Raft) SwitchToLeader() {

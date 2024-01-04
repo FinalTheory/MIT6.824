@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,15 +19,37 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	RPCTimeout = 60
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key        string
+	Value      string
+	Op         string
+	ToClientCh chan string
+	From       int
+	ClientId   int64
+	SeqNumber  int32
+}
+
+func (op *Op) RequestId() RequestId {
+	return RequestId{ClientId: op.ClientId, SeqNumber: op.SeqNumber}
+}
+
+type RequestId struct {
+	ClientId  int64
+	SeqNumber int32
+}
+
+type RequestInfo struct {
+	requestId RequestId
+	failCh    chan bool
 }
 
 type KVServer struct {
 	mu      sync.Mutex
+	rwLock  sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -34,16 +57,196 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	state           map[string]string
+	dedupTable      map[int64]int32
+	valueTable      map[int64]string
+	pendingRequests map[int]RequestInfo
+	killCh          chan bool
+	termCh          chan int
 }
 
+// ShouldStartCommand returns whether to accept this RPC
+func (kv *KVServer) ShouldStartCommand(clientId int64, newSeq int32, err *Err, value *string) bool {
+	kv.rwLock.RLock()
+	defer kv.rwLock.RUnlock()
+	seq, ok := kv.dedupTable[clientId]
+	if ok {
+		switch {
+		case newSeq == seq:
+			*err = OK
+			if value != nil {
+				*value = kv.valueTable[clientId]
+			}
+			return false
+		case newSeq < seq:
+			*err = ErrStaleRequest
+			return false
+		case newSeq > seq:
+			return true
+		}
+	}
+	// we should start command if client ID not in dedup table
+	return true
+}
+
+func (kv *KVServer) RecordRequestAtIndex(index int, id RequestId, failCh chan bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
+	// and then it's no longer a leader, thus these entries are finally overridden by another new leader
+	// at commit stage, current server will detect different operations are committed at these recorded indices
+	// thus wake up corresponding RPC request and fail them to force client retry.
+	kv.pendingRequests[index] = RequestInfo{requestId: id, failCh: failCh}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	if !kv.ShouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
+		return
+	}
+	clientCh := make(chan string, 1)
+	failCh := make(chan bool, 1)
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:        args.Key,
+		Op:         GetOp,
+		ToClientCh: clientCh,
+		From:       kv.me,
+		ClientId:   args.ClientId,
+		SeqNumber:  args.SeqNumber,
+	})
+	if isLeader {
+		DPrintf("[%d] Get start index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
+		defer DPrintf("[%d] Get end index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
+		kv.RecordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		// block until it's committed
+		select {
+		case <-failCh:
+			reply.Err = ErrLostLeadership
+		case result := <-clientCh:
+			reply.Value = result
+			reply.Err = OK
+		case <-time.After(time.Second * RPCTimeout):
+			reply.Err = ErrTimeOut
+		}
+	} else {
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	if !kv.ShouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, nil) {
+		return
+	}
+	clientCh := make(chan string, 1)
+	failCh := make(chan bool, 1)
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:        args.Key,
+		Value:      args.Value,
+		Op:         args.Op,
+		ToClientCh: clientCh,
+		From:       kv.me,
+		ClientId:   args.ClientId,
+		SeqNumber:  args.SeqNumber,
+	})
+	if isLeader {
+		DPrintf("[%d] PutAppend start index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
+		defer DPrintf("[%d] PutAppend end index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
+		kv.RecordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		// block until it's committed
+		select {
+		case <-failCh:
+			reply.Err = ErrLostLeadership
+		case <-clientCh:
+			reply.Err = OK
+		case <-time.After(time.Second * RPCTimeout):
+			reply.Err = ErrTimeOut
+		}
+	} else {
+		reply.Err = ErrWrongLeader
+	}
+}
+
+func (kv *KVServer) OperationExecutor() {
+	for !kv.killed() {
+		DPrintf("[%d] waiting for op", kv.me)
+		select {
+		// receives committed raft log entry
+		case cmd := <-kv.applyCh:
+			if cmd.TermChanged {
+				kv.FailAllPendingRequests()
+				continue
+			}
+			if !cmd.CommandValid {
+				continue
+			}
+			kv.FailConflictPendingRequests(cmd)
+			op := cmd.Command.(Op)
+			DPrintf("[%d] Apply command [%d] [%+v]", kv.me, cmd.CommandIndex, op)
+			result := kv.ApplyOperation(op)
+			// only notify completion when request waiting on same server and channel available
+			// we also need to ensure `ToClientCh` is not nil, because if server restarts before this entry committed
+			// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
+			// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
+			if op.From == kv.me && op.ToClientCh != nil {
+				op.ToClientCh <- result
+			}
+		case killed := <-kv.killCh:
+			if killed {
+				break
+			}
+		}
+	}
+}
+
+func (kv *KVServer) FailAllPendingRequests() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	for k, v := range kv.pendingRequests {
+		v.failCh <- true
+		delete(kv.pendingRequests, k)
+	}
+}
+
+func (kv *KVServer) FailConflictPendingRequests(cmd raft.ApplyMsg) {
+	op := cmd.Command.(Op)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	info, ok := kv.pendingRequests[cmd.CommandIndex]
+	if ok && info.requestId != op.RequestId() {
+		info.failCh <- true
+	}
+	delete(kv.pendingRequests, cmd.CommandIndex)
+}
+
+func (kv *KVServer) ApplyOperation(op Op) string {
+	result := ""
+	// No lock need here because the only competing goroutine is read only
+	seq, ok := kv.dedupTable[op.ClientId]
+	if ok && op.SeqNumber == seq {
+		return kv.valueTable[op.ClientId]
+	}
+	// Q: will there be op.SeqNumber < seq?
+	// no, because the sequence numbers occurred at commit stage is non-decreasing, it can only have duplicate caused by leader crash
+	// this is guaranteed by the fact that client will only increase sequence number when previous RPC has finished
+	// which means all lower sequence numbers have been committed for at least once
+	if op.Op == PutOp {
+		kv.state[op.Key] = op.Value
+	} else {
+		value, ok := kv.state[op.Key]
+		if !ok {
+			value = ""
+		}
+		switch op.Op {
+		case AppendOp:
+			kv.state[op.Key] = value + op.Value
+		case GetOp:
+			result = value
+		}
+	}
+	kv.rwLock.Lock()
+	kv.dedupTable[op.ClientId] = op.SeqNumber
+	kv.valueTable[op.ClientId] = result
+	kv.rwLock.Unlock()
+	return result
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -57,7 +260,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
+	kv.killCh <- true
 }
 
 func (kv *KVServer) killed() bool {
@@ -86,12 +289,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.killCh = make(chan bool, 10)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
+	kv.state = make(map[string]string)
+	kv.dedupTable = make(map[int64]int32)
+	kv.valueTable = make(map[int64]string)
+	kv.pendingRequests = make(map[int]RequestInfo)
+	go kv.OperationExecutor()
 
 	return kv
 }

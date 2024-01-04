@@ -81,6 +81,7 @@ func trace() string {
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
 type ApplyMsg struct {
+	TermChanged  bool
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
@@ -945,15 +946,15 @@ func (rf *Raft) CheckKillComplete() bool {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.condAppendEntries.Broadcast()
-	go func(start int64) {
-		for !rf.CheckKillComplete() {
-			time.Sleep(time.Millisecond * 100)
-			timeout := int64(10)
-			if time.Now().UnixMilli()-start > timeout*1000 {
-				log.Printf("Spent more than %ds to kill %p", timeout, rf)
-			}
-		}
-	}(time.Now().UnixMilli())
+	//go func(start int64) {
+	//	for !rf.CheckKillComplete() {
+	//		time.Sleep(time.Millisecond * 100)
+	//		timeout := int64(10)
+	//		if time.Now().UnixMilli()-start > timeout*1000 {
+	//			log.Printf("Spent more than %ds to kill %p", timeout, rf)
+	//		}
+	//	}
+	//}(time.Now().UnixMilli())
 }
 
 func (rf *Raft) killed() bool {
@@ -1104,6 +1105,7 @@ func (rf *Raft) HandleTermUpdateLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.SwitchToFollower()
+		*rf.applyCh <- ApplyMsg{TermChanged: true, CommandValid: false}
 	}
 }
 

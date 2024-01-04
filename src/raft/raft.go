@@ -179,6 +179,10 @@ func (c *LogContainer) TruncateFrom(from int) {
 	c.StartFrom = from
 }
 
+func (c *LogContainer) EntryValidAt(index int) bool {
+	return index >= c.StartFrom && index < c.Length()
+}
+
 func (c *LogContainer) TermValidAt(index int) bool {
 	return index >= max(c.LastIncludedIndex, 0) && index < c.Length()
 }
@@ -495,7 +499,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// PrevLogIndex = PrevLogTerm = -1 when leader log is empty
 	if !rf.log.IsEmpty() && args.PrevLogIndex != -1 {
-		if args.PrevLogIndex < rf.log.Length() {
+		if rf.log.TermValidAt(args.PrevLogIndex) {
 			term := rf.log.TermAt(args.PrevLogIndex)
 			// find the first log entry index with the mismatch term
 			if term != args.PrevLogTerm {
@@ -598,6 +602,8 @@ func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
 		entry := args.Entries[i]
 		index := args.PrevLogIndex + 1 + i
 		if index < rf.log.Length() {
+			// if we reach out here, we have verified term is valid at PrevLogIndex in follower log
+			// thus there exists term until end of follower log, meaning `rf.log.EntryValidAt(index) == true` in this loop
 			if rf.log.TermAt(index) != entry.Term {
 				truncateTo = index
 				break
@@ -828,7 +834,7 @@ func (rf *Raft) SendSnapshotOnce(server int, term int, snapshot []byte, lastIncl
 }
 
 func (rf *Raft) FindTermInLogLocked(start int, term int) int {
-	for i := start; rf.log.TermValidAt(i); i -= 1 {
+	for i := start; rf.log.EntryValidAt(i); i -= 1 {
 		if rf.log.TermAt(i) == term {
 			return i
 		}
@@ -851,19 +857,25 @@ func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesAr
 			// if we skip this entire term in leader's log, we're skipping too much
 			// thus we resend the last entry in the term and see if we could succeed
 			// e.g.
-			// leader:   1 1 1 2 2
-			// follower: 1 1 1 1
+			// leader:   0 0 1 1 1 2 2
+			// follower: 0 0 1 1 1 1
 			// if leader send the last entry with term `2` to follower, it will fail because previous log term mismatch (2 != 1)
-			// but it will be step back too much if we skip the term 1 entirely
-			// thus we retry with the last entry with term 1 in leader log, and we can expect it's likely succeed
-			// Notice: here it could also be `rf.nextIndex[server] = idx + 1`, based on description from https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
-			// > If it finds an entry in its log with that term, it should set nextIndex to be the one **beyond** the index of the last entry in that term in its log.
+			// but it will be step back too much if we skip the term 1 entirely and send from last term `0` entry
+			// thus we retry with the last entry of term `1` in leader log, and we can expect it's likely succeed
 			rf.nextIndex[server] = idx
+			// Notice: above could also be `nextIndex[server] = idx + 1`, based on description from https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+			// > If it finds an entry in its log with that term, it should set nextIndex to be the one **beyond** the index of the last entry in that term in its log.
+			// Either way is safe, since it guarantees:
+			// 1. XIndex <= PrevLogIndex
+			// 2. idx < PrevLogIndex or idx == -1
+			// thus the alternative way also guarantees nextIndex is keep decreasing
 		}
 	}
 }
 
 func (rf *Raft) UpdateCommitIndexLocked() {
+	// only log entries <= commitIndex can be trimmed to snapshot
+	// thus it's guaranteed entry with index commitIndex + 1 is still available in log
 	for n := rf.commitIndex + 1; n < rf.log.Length(); n += 1 {
 		if rf.log.TermAt(n) != rf.currentTerm {
 			continue

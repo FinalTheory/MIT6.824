@@ -212,7 +212,7 @@ func (c *LogContainer) IsEmpty() bool {
 	return c.Length() == 0
 }
 
-func (c *LogContainer) Snapshot(index int) {
+func (c *LogContainer) SnapshotTo(index int) {
 	// notice this index is internal and starts from 0
 	c.LastIncludedIndex = index
 	c.LastIncludedTerm = c.Get(index).Term
@@ -364,7 +364,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			"snapshotSize": len(s),
 		}))
 		// the index here is internal and start from 0
-		rf.log.Snapshot(idx)
+		rf.log.SnapshotTo(idx)
 		rf.snapshot = s
 		rf.persist()
 	}(index-1, snapshot)
@@ -560,20 +560,20 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term < rf.currentTerm {
 		return
 	}
-	// follower contains more log entries than snapshot
-	if args.LastIncludedIndex < rf.log.Length() && rf.log.TermAt(args.LastIncludedIndex) == args.LastIncludedTerm {
-		rf.log.Snapshot(args.LastIncludedIndex)
-		rf.commitIndex = max(args.LastIncludedIndex, rf.commitIndex)
-		rf.lastApplied = max(args.LastIncludedIndex, rf.lastApplied)
-		rf.snapshot = args.Data
-		rf.persist()
-		rf.ApplySnapshotLocked(args)
+	if args.LastIncludedIndex < rf.log.StartFrom {
 		return
 	}
-	// discard entire log
-	rf.log.Reset(args.LastIncludedIndex, args.LastIncludedTerm)
-	rf.commitIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
+	// follower contains more log entries than snapshot
+	if args.LastIncludedIndex < rf.log.Length() && rf.log.TermAt(args.LastIncludedIndex) == args.LastIncludedTerm {
+		rf.log.SnapshotTo(args.LastIncludedIndex)
+		rf.commitIndex = max(args.LastIncludedIndex, rf.commitIndex)
+		rf.lastApplied = max(args.LastIncludedIndex, rf.lastApplied)
+	} else {
+		// discard entire log
+		rf.log.Reset(args.LastIncludedIndex, args.LastIncludedTerm)
+		rf.commitIndex = args.LastIncludedIndex
+		rf.lastApplied = args.LastIncludedIndex
+	}
 	rf.snapshot = args.Data
 	rf.persist()
 	rf.ApplySnapshotLocked(args)
@@ -844,7 +844,7 @@ func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesAr
 		// and return the last log entry index of the term
 		idx := rf.FindTermInLogLocked(args.PrevLogIndex, reply.XTerm)
 		if idx == -1 {
-			// mismatch term not in leader log, we're safe to skip the entire mismatch term in follower log
+			// mismatched term (from follower) not in leader log, we're safe to skip the entire mismatch term in follower log
 			rf.nextIndex[server] = reply.XIndex
 		} else {
 			// if found, we know at least to some index before PrevLogIndex in the term, the follower has matching logs with leader
@@ -856,6 +856,8 @@ func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesAr
 			// if leader send the last entry with term `2` to follower, it will fail because previous log term mismatch (2 != 1)
 			// but it will be step back too much if we skip the term 1 entirely
 			// thus we retry with the last entry with term 1 in leader log, and we can expect it's likely succeed
+			// Notice: here it could also be `rf.nextIndex[server] = idx + 1`, based on description from https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+			// > If it finds an entry in its log with that term, it should set nextIndex to be the one **beyond** the index of the last entry in that term in its log.
 			rf.nextIndex[server] = idx
 		}
 	}
@@ -884,24 +886,24 @@ func (rf *Raft) ApplyEntryLocked() {
 	if rf.lastApplied == rf.commitIndex {
 		return
 	}
+	lastApplied := rf.lastApplied
+	commitIndex := rf.commitIndex
 	entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
-		entries = append(entries, rf.log.Get(i))
-	}
-	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
-		"inclusiveStart": rf.lastApplied + 1,
-		"inclusiveEnd":   rf.commitIndex,
-		"entries":        fmt.Sprintf("%v", entries),
-	}))
-
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
+		entry := rf.log.Get(i)
+		entries = append(entries, entry)
 		*rf.applyCh <- ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log.Get(i).Command,
+			Command:      entry.Command,
 			CommandIndex: i + 1,
 		}
 		rf.lastApplied = i
 	}
+	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+		"inclusiveStart": lastApplied + 1,
+		"inclusiveEnd":   commitIndex,
+		"entries":        fmt.Sprintf("%v", entries),
+	}))
 }
 
 func (rf *Raft) CheckKillComplete() bool {
@@ -1151,6 +1153,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
+	// skip log entries that already in snapshot
+	rf.commitIndex = rf.log.LastIncludedIndex
+	rf.lastApplied = rf.log.LastIncludedIndex
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

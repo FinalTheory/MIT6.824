@@ -22,7 +22,9 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
+	"runtime/pprof"
 
 	//	"bytes"
 	"math/rand"
@@ -275,11 +277,13 @@ type Raft struct {
 	tickerKilled    atomic.Bool
 	heartbeatKilled atomic.Bool
 	daemonKilled    []atomic.Bool
+	killCh          chan bool
+	killChSize      int
 }
 
 func (rf *Raft) DebugLock() {
 	for !rf.mu.TryLock() {
-		log.Printf("Failed to acquire lock hold by %s", rf.lockOwner)
+		log.Printf("[%p][%d] Failed to acquire lock hold by %s", rf, rf.me, rf.lockOwner)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -585,12 +589,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) ApplySnapshotLocked(args *InstallSnapshotArgs) {
-	*rf.applyCh <- ApplyMsg{
+	msg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      rf.snapshot,
 		// notice we need to transform internal index to tester
 		SnapshotIndex: args.LastIncludedIndex + 1,
 		SnapshotTerm:  args.LastIncludedTerm,
+	}
+	select {
+	case *rf.applyCh <- msg:
+	case <-rf.killCh:
+		return
 	}
 }
 
@@ -905,10 +914,16 @@ func (rf *Raft) ApplyEntryLocked() {
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
 		entry := rf.log.Get(i)
 		entries = append(entries, entry)
-		*rf.applyCh <- ApplyMsg{
+		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: i + 1,
+		}
+		select {
+		case *rf.applyCh <- msg:
+			// do nothing
+		case <-rf.killCh:
+			return
 		}
 		rf.lastApplied = i
 	}
@@ -946,15 +961,21 @@ func (rf *Raft) CheckKillComplete() bool {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.condAppendEntries.Broadcast()
-	//go func(start int64) {
-	//	for !rf.CheckKillComplete() {
-	//		time.Sleep(time.Millisecond * 100)
-	//		timeout := int64(10)
-	//		if time.Now().UnixMilli()-start > timeout*1000 {
-	//			log.Printf("Spent more than %ds to kill %p", timeout, rf)
-	//		}
-	//	}
-	//}(time.Now().UnixMilli())
+	for i := 0; i < rf.killChSize; i += 1 {
+		rf.killCh <- true
+	}
+	// TODO: why Raft can not be fully killed? also need a check for kv server
+	go func(start int64) {
+		for !rf.CheckKillComplete() {
+			time.Sleep(time.Millisecond * 100)
+			timeout := int64(10)
+			if time.Now().UnixMilli()-start > timeout*1000 {
+				log.Printf("Spent more than %ds to kill %p", timeout, rf)
+				fid, _ := os.Create("goroutine.txt")
+				pprof.Lookup("goroutine").WriteTo(fid, 2)
+			}
+		}
+	}(time.Now().UnixMilli())
 }
 
 func (rf *Raft) killed() bool {
@@ -1105,7 +1126,11 @@ func (rf *Raft) HandleTermUpdateLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.SwitchToFollower()
-		*rf.applyCh <- ApplyMsg{TermChanged: true, CommandValid: false}
+		msg := ApplyMsg{TermChanged: true, CommandValid: false}
+		select {
+		case *rf.applyCh <- msg:
+		case <-rf.killCh:
+		}
 	}
 }
 
@@ -1137,6 +1162,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	TraceEventBegin(true, "Follower", me, time.Now().UnixMicro(), nil)
 	rf := &Raft{}
 	rf.applyCh = &applyCh
+	// in case Kill() is called more than once or more goroutines needs to be terminated
+	rf.killChSize = 16
+	rf.killCh = make(chan bool, rf.killChSize)
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me

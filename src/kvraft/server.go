@@ -63,6 +63,8 @@ type KVServer struct {
 	pendingRequests map[int]RequestInfo
 	killCh          chan bool
 	termCh          chan int
+
+	executorKilled atomic.Bool
 }
 
 // ShouldStartCommand returns whether to accept this RPC
@@ -195,6 +197,7 @@ func (kv *KVServer) OperationExecutor() {
 			}
 		}
 	}
+	kv.executorKilled.Store(true)
 }
 
 func (kv *KVServer) FailAllPendingRequests() {
@@ -261,6 +264,19 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	kv.killCh <- true
+	go func(start int64) {
+		for !kv.CheckKillComplete() {
+			time.Sleep(time.Millisecond * 100)
+			timeout := int64(10)
+			if time.Now().UnixMilli()-start > timeout*1000 {
+				log.Printf("Spent more than %ds to kill %p", timeout, kv)
+			}
+		}
+	}(time.Now().UnixMilli())
+}
+
+func (kv *KVServer) CheckKillComplete() bool {
+	return kv.executorKilled.Load()
 }
 
 func (kv *KVServer) killed() bool {
@@ -296,6 +312,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.dedupTable = make(map[int64]int32)
 	kv.valueTable = make(map[int64]string)
 	kv.pendingRequests = make(map[int]RequestInfo)
+	kv.executorKilled.Store(false)
 	go kv.OperationExecutor()
 
 	return kv

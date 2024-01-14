@@ -274,6 +274,7 @@ type Raft struct {
 	lastReceivedRPC int64
 	electionTimeout int64
 
+	// states used to kill raft service
 	tickerKilled    atomic.Bool
 	heartbeatKilled atomic.Bool
 	daemonKilled    []atomic.Bool

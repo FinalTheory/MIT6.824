@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -48,22 +49,25 @@ type RequestInfo struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	rwLock  sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
-	state           map[string]string
-	dedupTable      map[int64]int32
-	valueTable      map[int64]string
+	state map[string]string
+
+	rwLock     sync.RWMutex
+	dedupTable map[int64]int32
+	valueTable map[int64]string
+
+	mu              sync.Mutex
 	pendingRequests map[int]RequestInfo
-	killCh          chan bool
-	termCh          chan int
 
+	// states related to gracefully kill
+	killCh         chan bool
 	executorKilled atomic.Bool
 }
 
@@ -177,6 +181,10 @@ func (kv *KVServer) OperationExecutor() {
 				kv.FailAllPendingRequests()
 				continue
 			}
+			if cmd.SnapshotValid {
+				kv.ReloadFromSnapshot(cmd.Snapshot)
+				continue
+			}
 			if !cmd.CommandValid {
 				continue
 			}
@@ -190,6 +198,9 @@ func (kv *KVServer) OperationExecutor() {
 			// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
 			if op.From == kv.me && op.ToClientCh != nil {
 				op.ToClientCh <- result
+			}
+			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				kv.DoSnapshot(cmd)
 			}
 		case killed := <-kv.killCh:
 			if killed {
@@ -252,6 +263,39 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 	return result
 }
 
+func (kv *KVServer) DoSnapshot(cmd raft.ApplyMsg) {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	if err := e.Encode(kv.state); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(kv.dedupTable); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(kv.valueTable); err != nil {
+		log.Fatal(err)
+	}
+	state := buf.Bytes()
+	kv.rf.Snapshot(cmd.CommandIndex, state)
+}
+
+func (kv *KVServer) ReloadFromSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var state map[string]string
+	var dedupTable map[int64]int32
+	var valueTable map[int64]string
+	if d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&valueTable) != nil {
+		panic("Failed to reload persisted snapshot into application.")
+	}
+	kv.state = state
+	kv.dedupTable = dedupTable
+	kv.valueTable = valueTable
+}
+
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -303,6 +347,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv := new(KVServer)
 	kv.me = me
+	kv.persister = persister
 	kv.maxraftstate = maxraftstate
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -313,6 +358,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.valueTable = make(map[int64]string)
 	kv.pendingRequests = make(map[int]RequestInfo)
 	kv.executorKilled.Store(false)
+	kv.ReloadFromSnapshot(persister.ReadSnapshot())
 	go kv.OperationExecutor()
 
 	return kv

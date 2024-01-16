@@ -267,6 +267,7 @@ type Raft struct {
 	nextIndex         []int
 	matchIndex        []int
 	condAppendEntries *sync.Cond
+	condApplyEntries  *sync.Cond
 
 	log      LogContainer
 	snapshot []byte
@@ -363,7 +364,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// notice this index from tester and start from 1
-	go func(idx int, s []byte) {
+	func(idx int, s []byte) {
 		rf.Lock()
 		defer rf.Unlock()
 		if idx < rf.log.StartFrom {
@@ -539,7 +540,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		newCommitIndex := min(args.LeaderCommit, lastNewEntryIndex)
 		if newCommitIndex > rf.commitIndex {
 			rf.commitIndex = newCommitIndex
-			rf.ApplyEntryLocked()
+			rf.condApplyEntries.Signal()
 		}
 	}
 	reply.Success = true
@@ -586,22 +587,20 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	rf.snapshot = args.Data
 	rf.persist()
-	rf.ApplySnapshotLocked(args)
-}
-
-func (rf *Raft) ApplySnapshotLocked(args *InstallSnapshotArgs) {
 	msg := ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      rf.snapshot,
+		Snapshot:      clone(rf.snapshot),
 		// notice we need to transform internal index to tester
 		SnapshotIndex: args.LastIncludedIndex + 1,
 		SnapshotTerm:  args.LastIncludedTerm,
 	}
-	select {
-	case *rf.applyCh <- msg:
-	case <-rf.killCh:
-		return
-	}
+	go func(m ApplyMsg) {
+		select {
+		case *rf.applyCh <- m:
+		case <-rf.killCh:
+			return
+		}
+	}(msg)
 }
 
 func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
@@ -902,37 +901,46 @@ func (rf *Raft) UpdateCommitIndexLocked() {
 			rf.commitIndex = n
 		}
 	}
-	rf.ApplyEntryLocked()
+	rf.condApplyEntries.Signal()
 }
 
-func (rf *Raft) ApplyEntryLocked() {
-	if rf.lastApplied == rf.commitIndex {
-		return
-	}
-	lastApplied := rf.lastApplied
-	commitIndex := rf.commitIndex
-	entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
-		entry := rf.log.Get(i)
-		entries = append(entries, entry)
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: i + 1,
+func (rf *Raft) DaemonApplyEntry() {
+	for !rf.killed() {
+		rf.Lock()
+		for rf.lastApplied == rf.commitIndex {
+			rf.condApplyEntries.Wait()
 		}
-		select {
-		case *rf.applyCh <- msg:
-			// do nothing
-		case <-rf.killCh:
-			return
+		lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
+		entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
+		messages := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
+			entry := rf.log.Get(i)
+			entries = append(entries, entry)
+			messages = append(messages, ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: i + 1,
+			})
+			rf.lastApplied = i
 		}
-		rf.lastApplied = i
+		rf.Unlock()
+
+		TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+			"inclusiveStart": lastApplied + 1,
+			"inclusiveEnd":   commitIndex,
+			"entries":        fmt.Sprintf("%v", entries),
+		}))
+
+		for _, msg := range messages {
+			select {
+			case *rf.applyCh <- msg:
+				// do nothing
+			case <-rf.killCh:
+				return
+			}
+		}
 	}
-	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
-		"inclusiveStart": lastApplied + 1,
-		"inclusiveEnd":   commitIndex,
-		"entries":        fmt.Sprintf("%v", entries),
-	}))
 }
 
 func (rf *Raft) CheckKillComplete() bool {
@@ -1180,6 +1188,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 	rf.votedFor = Null
 	rf.condAppendEntries = sync.NewCond(&rf.mu)
+	rf.condApplyEntries = sync.NewCond(&rf.mu)
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
@@ -1204,6 +1213,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeat()
+	go rf.DaemonApplyEntry()
 
 	return rf
 }

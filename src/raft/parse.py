@@ -6,14 +6,14 @@ defaults = ["Leader", "Follower", "Candidate", "End"]
 
 
 def work(fname, events):
-    entries = [s for s in events if s.isdigit()]
+    entries = [s for s in events if s.isdigit() or ' ' in s]
     results = []
     def filter_by_entry(item):
         if len(entries) == 0:
             return True
         if "args" not in item or item["args"] is None:
             return True
-        if "entries" not in item["args"] and "entry" not in item["args"]:
+        if "args.Entries" not in item["args"] and "entry" not in item["args"] and "entries" not in item["args"]:
             return True
         for e in entries:
             if e in json.dumps(item):

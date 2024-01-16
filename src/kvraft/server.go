@@ -242,11 +242,13 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 	// no, because the sequence numbers occurred at commit stage is non-decreasing, it can only have duplicate caused by leader crash
 	// this is guaranteed by the fact that client will only increase sequence number when previous RPC has finished
 	// which means all lower sequence numbers have been committed for at least once
+	kv.rwLock.Lock()
+	defer kv.rwLock.Unlock()
 	if op.Op == PutOp {
 		kv.state[op.Key] = op.Value
 	} else {
-		value, ok := kv.state[op.Key]
-		if !ok {
+		value, ok_ := kv.state[op.Key]
+		if !ok_ {
 			value = ""
 		}
 		switch op.Op {
@@ -256,10 +258,8 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 			result = value
 		}
 	}
-	kv.rwLock.Lock()
 	kv.dedupTable[op.ClientId] = op.SeqNumber
 	kv.valueTable[op.ClientId] = result
-	kv.rwLock.Unlock()
 	return result
 }
 
@@ -291,6 +291,8 @@ func (kv *KVServer) ReloadFromSnapshot(data []byte) {
 	if d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&valueTable) != nil {
 		panic("Failed to reload persisted snapshot into application.")
 	}
+	kv.rwLock.Lock()
+	defer kv.rwLock.Unlock()
 	kv.state = state
 	kv.dedupTable = dedupTable
 	kv.valueTable = valueTable

@@ -5,7 +5,6 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 	"bytes"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -71,7 +70,7 @@ type KVServer struct {
 	killCh         chan bool
 	executorKilled atomic.Bool
 
-	lastCommandIndex int
+	lastAppliedIndex int
 }
 
 // ShouldStartCommand returns whether to accept this RPC
@@ -189,19 +188,19 @@ func (kv *KVServer) OperationExecutor() {
 				kv.FailAllPendingRequests()
 				continue
 			}
-			if cmd.SnapshotValid && cmd.SnapshotIndex > kv.lastCommandIndex {
+			if cmd.SnapshotValid && cmd.SnapshotIndex > kv.lastAppliedIndex {
 				kv.ReloadFromSnapshot(cmd.Snapshot)
-				kv.lastCommandIndex = cmd.SnapshotIndex
+				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
 			}
-			if !cmd.CommandValid || cmd.CommandIndex <= kv.lastCommandIndex {
+			if !cmd.CommandValid || cmd.CommandIndex <= kv.lastAppliedIndex {
 				continue
 			}
 			kv.FailConflictPendingRequests(cmd)
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", kv.me, cmd.CommandIndex, op)
 			result := kv.ApplyOperation(op)
-			kv.lastCommandIndex = cmd.CommandIndex
+			kv.lastAppliedIndex = cmd.CommandIndex
 			// only notify completion when request waiting on same server and channel available
 			// we also need to ensure `ToClientCh` is not nil, because if server restarts before this entry committed
 			// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
@@ -268,10 +267,10 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 			result = value
 		}
 	}
-	raft.TraceInstant("Apply", kv.me, time.Now().UnixMicro(), map[string]any{
-		"op":    fmt.Sprintf("%+v", op),
-		"state": kv.state[op.Key],
-	})
+	//raft.TraceInstant("Apply", kv.me, time.Now().UnixMicro(), map[string]any{
+	//	"op":    fmt.Sprintf("%+v", op),
+	//	"state": kv.state[op.Key],
+	//})
 	kv.dedupTable[op.ClientId] = op.SeqNumber
 	kv.valueTable[op.ClientId] = result
 	return result
@@ -280,6 +279,9 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 func (kv *KVServer) DoSnapshot(cmd raft.ApplyMsg) {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
+	if err := e.Encode(kv.lastAppliedIndex); err != nil {
+		log.Fatal(err)
+	}
 	if err := e.Encode(kv.state); err != nil {
 		log.Fatal(err)
 	}
@@ -299,10 +301,11 @@ func (kv *KVServer) ReloadFromSnapshot(data []byte) {
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
+	var lastAppliedIndex int
 	var state map[string]string
 	var dedupTable map[int64]int32
 	var valueTable map[int64]string
-	if d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&valueTable) != nil {
+	if d.Decode(&lastAppliedIndex) != nil || d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&valueTable) != nil {
 		panic("Failed to reload persisted snapshot into application.")
 	}
 	kv.rwLock.Lock()
@@ -310,6 +313,7 @@ func (kv *KVServer) ReloadFromSnapshot(data []byte) {
 	kv.state = state
 	kv.dedupTable = dedupTable
 	kv.valueTable = valueTable
+	kv.lastAppliedIndex = lastAppliedIndex
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -365,7 +369,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.persister = persister
 	kv.maxraftstate = maxraftstate
-	kv.lastCommandIndex = 0
+	kv.lastAppliedIndex = 0
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.killCh = make(chan bool, 10)

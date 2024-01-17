@@ -279,6 +279,7 @@ type Raft struct {
 	tickerKilled    atomic.Bool
 	heartbeatKilled atomic.Bool
 	daemonKilled    []atomic.Bool
+	applierKilled   atomic.Bool
 	killCh          chan bool
 	killChSize      int
 }
@@ -911,9 +912,10 @@ func (rf *Raft) UpdateCommitIndexLocked() {
 }
 
 func (rf *Raft) DaemonApplyEntry() {
+	defer rf.applierKilled.Store(true)
 	for !rf.killed() {
 		rf.Lock()
-		for rf.lastApplied == rf.commitIndex {
+		for rf.lastApplied == rf.commitIndex && !rf.killed() {
 			rf.condApplyEntries.Wait()
 		}
 		lastApplied := rf.lastApplied
@@ -956,6 +958,9 @@ func (rf *Raft) CheckKillComplete() bool {
 	if !rf.heartbeatKilled.Load() {
 		return false
 	}
+	if !rf.applierKilled.Load() {
+		return false
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me && !rf.daemonKilled[i].Load() {
 			return false
@@ -976,6 +981,7 @@ func (rf *Raft) CheckKillComplete() bool {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.condAppendEntries.Broadcast()
+	rf.condApplyEntries.Broadcast()
 	for i := 0; i < rf.killChSize; i += 1 {
 		rf.killCh <- true
 	}

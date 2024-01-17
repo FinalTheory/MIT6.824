@@ -69,6 +69,8 @@ type KVServer struct {
 	// states related to gracefully kill
 	killCh         chan bool
 	executorKilled atomic.Bool
+
+	lastCommandIndex int
 }
 
 // ShouldStartCommand returns whether to accept this RPC
@@ -181,17 +183,19 @@ func (kv *KVServer) OperationExecutor() {
 				kv.FailAllPendingRequests()
 				continue
 			}
-			if cmd.SnapshotValid {
+			if cmd.SnapshotValid && cmd.SnapshotIndex > kv.lastCommandIndex {
 				kv.ReloadFromSnapshot(cmd.Snapshot)
+				kv.lastCommandIndex = cmd.SnapshotIndex
 				continue
 			}
-			if !cmd.CommandValid {
+			if !cmd.CommandValid || cmd.CommandIndex <= kv.lastCommandIndex {
 				continue
 			}
 			kv.FailConflictPendingRequests(cmd)
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", kv.me, cmd.CommandIndex, op)
 			result := kv.ApplyOperation(op)
+			kv.lastCommandIndex = cmd.CommandIndex
 			// only notify completion when request waiting on same server and channel available
 			// we also need to ensure `ToClientCh` is not nil, because if server restarts before this entry committed
 			// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
@@ -258,6 +262,10 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 			result = value
 		}
 	}
+	//raft.TraceInstant("Apply", kv.me, time.Now().UnixMicro(), map[string]any{
+	//	"op":    fmt.Sprintf("%+v", op),
+	//	"state": kv.state[op.Key],
+	//})
 	kv.dedupTable[op.ClientId] = op.SeqNumber
 	kv.valueTable[op.ClientId] = result
 	return result
@@ -351,6 +359,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.persister = persister
 	kv.maxraftstate = maxraftstate
+	kv.lastCommandIndex = 0
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.killCh = make(chan bool, 10)

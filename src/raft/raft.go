@@ -611,14 +611,15 @@ func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
 	for ; i < len(args.Entries); i++ {
 		entry := args.Entries[i]
 		index := args.PrevLogIndex + 1 + i
-		if index < rf.log.Length() {
-			// if we reach out here, we have verified term is valid at PrevLogIndex in follower log
-			// thus there exists term until end of follower log, meaning `rf.log.EntryValidAt(index) == true` in this loop
+		// it is possible an RPC suffered long latency and entry at `index` is already in snapshot
+		// thus we only truncate the part that still available in log
+		if rf.log.EntryValidAt(index) {
 			if rf.log.TermAt(index) != entry.Term {
 				truncateTo = index
 				break
 			}
-		} else {
+		}
+		if index >= rf.log.Length() {
 			break
 		}
 	}
@@ -752,6 +753,11 @@ func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
 		prevLogTerm := rf.log.TermAt(nextIndex - 1)
 		if nextIndex >= 1 && prevLogTerm == -1 {
 			// we expect to see a valid `PrevLogTerm` but it's already in snapshot
+			sendSnapshot = true
+		}
+		if nextIndex == 0 && rf.log.StartFrom > 0 {
+			// if we need to send log from very beginning, need to ensure those log entries still exists
+			// otherwise we send snapshot instead
 			sendSnapshot = true
 		}
 		if sendSnapshot {

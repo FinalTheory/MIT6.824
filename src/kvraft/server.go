@@ -5,6 +5,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -267,10 +268,10 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 			result = value
 		}
 	}
-	//raft.TraceInstant("Apply", kv.me, time.Now().UnixMicro(), map[string]any{
-	//	"op":    fmt.Sprintf("%+v", op),
-	//	"state": kv.state[op.Key],
-	//})
+	raft.TraceInstant("Apply", kv.me, time.Now().UnixMicro(), map[string]any{
+		"op":    fmt.Sprintf("%+v", op),
+		"state": kv.state[op.Key],
+	})
 	kv.dedupTable[op.ClientId] = op.SeqNumber
 	kv.valueTable[op.ClientId] = result
 	return result

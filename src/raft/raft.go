@@ -247,7 +247,7 @@ func (c *LogContainer) GetTraceState() map[string]any {
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
-	lockOwner string
+	lockOwner atomic.Pointer[string]
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -267,13 +267,15 @@ type Raft struct {
 	nextIndex         []int
 	matchIndex        []int
 	condAppendEntries *sync.Cond
-	condApplyEntries  *sync.Cond
+	condApplyMsg      *sync.Cond
 
 	log      LogContainer
 	snapshot []byte
 
 	lastReceivedRPC int64
 	electionTimeout int64
+
+	msgQueue []ApplyMsg
 
 	// states used to kill raft service
 	tickerKilled    atomic.Bool
@@ -286,18 +288,22 @@ type Raft struct {
 
 func (rf *Raft) DebugLock() {
 	for !rf.mu.TryLock() {
-		log.Printf("[%p][%d] Failed to acquire lock hold by %s", rf, rf.me, rf.lockOwner)
-		time.Sleep(100 * time.Millisecond)
+		owner := rf.lockOwner.Load()
+		if owner != nil {
+			log.Printf("[%p][%d] Failed to acquire lock hold by %s", rf, rf.me, *owner)
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
 func (rf *Raft) Lock() {
 	rf.mu.Lock()
-	rf.lockOwner = trace()
+	name := trace()
+	rf.lockOwner.Store(&name)
 }
 
 func (rf *Raft) Unlock() {
-	rf.lockOwner = ""
+	rf.lockOwner.Store(nil)
 	rf.mu.Unlock()
 }
 
@@ -541,7 +547,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		newCommitIndex := min(args.LeaderCommit, lastNewEntryIndex)
 		if newCommitIndex > rf.commitIndex {
 			rf.commitIndex = newCommitIndex
-			rf.condApplyEntries.Signal()
+			rf.ApplyEntryLocked()
 		}
 	}
 	reply.Success = true
@@ -595,13 +601,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: args.LastIncludedIndex + 1,
 		SnapshotTerm:  args.LastIncludedTerm,
 	}
-	go func(m ApplyMsg) {
-		select {
-		case *rf.applyCh <- m:
-		case <-rf.killCh:
-			return
-		}
-	}(msg)
+	rf.msgQueue = append(rf.msgQueue, msg)
+	rf.condApplyMsg.Signal()
 }
 
 func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
@@ -908,39 +909,43 @@ func (rf *Raft) UpdateCommitIndexLocked() {
 			rf.commitIndex = n
 		}
 	}
-	rf.condApplyEntries.Signal()
+	rf.ApplyEntryLocked()
 }
 
-func (rf *Raft) DaemonApplyEntry() {
+func (rf *Raft) ApplyEntryLocked() {
+	lastApplied := rf.lastApplied
+	commitIndex := rf.commitIndex
+	entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
+		entry := rf.log.Get(i)
+		entries = append(entries, entry)
+		rf.msgQueue = append(rf.msgQueue, ApplyMsg{
+			CommandValid: true,
+			Command:      entry.Command,
+			CommandIndex: i + 1,
+		})
+		rf.lastApplied = i
+	}
+	rf.condApplyMsg.Signal()
+	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+		"inclusiveStart": lastApplied + 1,
+		"inclusiveEnd":   commitIndex,
+		"entries":        fmt.Sprintf("%v", entries),
+	}))
+}
+
+func (rf *Raft) DaemonApplyMsg() {
 	defer rf.applierKilled.Store(true)
 	for !rf.killed() {
 		rf.Lock()
-		for rf.lastApplied == rf.commitIndex && !rf.killed() {
-			rf.condApplyEntries.Wait()
+		for len(rf.msgQueue) == 0 && !rf.killed() {
+			rf.condApplyMsg.Wait()
 		}
-		lastApplied := rf.lastApplied
-		commitIndex := rf.commitIndex
-		entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
-		messages := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i += 1 {
-			entry := rf.log.Get(i)
-			entries = append(entries, entry)
-			messages = append(messages, ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: i + 1,
-			})
-			rf.lastApplied = i
-		}
+		data := rf.msgQueue
+		rf.msgQueue = make([]ApplyMsg, 0)
 		rf.Unlock()
 
-		TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
-			"inclusiveStart": lastApplied + 1,
-			"inclusiveEnd":   commitIndex,
-			"entries":        fmt.Sprintf("%v", entries),
-		}))
-
-		for _, msg := range messages {
+		for _, msg := range data {
 			select {
 			case *rf.applyCh <- msg:
 				// do nothing
@@ -981,11 +986,10 @@ func (rf *Raft) CheckKillComplete() bool {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.condAppendEntries.Broadcast()
-	rf.condApplyEntries.Broadcast()
+	rf.condApplyMsg.Broadcast()
 	for i := 0; i < rf.killChSize; i += 1 {
 		rf.killCh <- true
 	}
-	// TODO: why Raft can not be fully killed? also need a check for kv server
 	go func(start int64) {
 		for !rf.CheckKillComplete() {
 			time.Sleep(time.Millisecond * 100)
@@ -1148,10 +1152,8 @@ func (rf *Raft) HandleTermUpdateLocked(term int) {
 		rf.currentTerm = term
 		rf.SwitchToFollower()
 		msg := ApplyMsg{TermChanged: true, CommandValid: false}
-		select {
-		case *rf.applyCh <- msg:
-		case <-rf.killCh:
-		}
+		rf.msgQueue = append(rf.msgQueue, msg)
+		rf.condApplyMsg.Signal()
 	}
 }
 
@@ -1200,7 +1202,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 	rf.votedFor = Null
 	rf.condAppendEntries = sync.NewCond(&rf.mu)
-	rf.condApplyEntries = sync.NewCond(&rf.mu)
+	rf.condApplyMsg = sync.NewCond(&rf.mu)
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
@@ -1225,7 +1227,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeat()
-	go rf.DaemonApplyEntry()
+	go rf.DaemonApplyMsg()
 
 	return rf
 }

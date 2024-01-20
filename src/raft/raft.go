@@ -158,7 +158,7 @@ func (c *LogContainer) LastLogTerm() int {
 
 func (c *LogContainer) SliceFrom(start int) []LogEntry {
 	actualStart := start - c.StartFrom
-	if actualStart > c.Length() || actualStart < 0 {
+	if actualStart > len(c.Data) || actualStart < 0 {
 		panic(fmt.Sprintf("Invalid slice start %d", actualStart))
 	}
 	return c.Data[actualStart:]
@@ -322,6 +322,7 @@ func (rf *Raft) GetTraceState() map[string]any {
 		"raft.currentTerm": rf.currentTerm,
 		"raft.commitIndex": rf.commitIndex,
 		"raft.lastApplied": rf.lastApplied,
+		"raft.nextIndex":   fmt.Sprintf("%v", rf.nextIndex),
 	})
 }
 
@@ -862,7 +863,10 @@ func (rf *Raft) FindTermInLogLocked(start int, term int) int {
 
 func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.XTerm == -1 {
-		rf.nextIndex[server] = reply.XLen
+		// follower's log at `PrevLogIndex` could be either too short or already in snapshot
+		// in the latter case, follower might actually have longer log size (e.g. `reply.XLen > rf.log.Length()`)
+		// we only need to ensure `nextIndex` is decreasing on failure, and it will finally cause leader to send a snapshot instead
+		rf.nextIndex[server] = min(reply.XLen, max(rf.nextIndex[server]-1, 0))
 	} else {
 		// check if the conflict term in follower also exists in leader
 		// and return the last log entry index of the term

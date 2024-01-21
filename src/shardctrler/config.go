@@ -332,6 +332,7 @@ func (cfg *config) make_partition() ([]int, []int) {
 }
 
 func make_config(t *testing.T, n int, unreliable bool) *config {
+	raft.InitNewTrace()
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t

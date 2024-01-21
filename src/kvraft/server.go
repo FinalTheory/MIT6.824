@@ -45,8 +45,8 @@ type RequestId struct {
 }
 
 type RequestInfo struct {
-	requestId RequestId
-	failCh    chan bool
+	RequestId RequestId
+	FailCh    chan bool
 }
 
 type KVServer struct {
@@ -110,7 +110,7 @@ func (kv *KVServer) RecordRequestAtIndex(index int, id RequestId, failCh chan bo
 	// and then it's no longer a leader, thus these entries are finally overridden by another new leader
 	// at commit stage, current server will detect different operations are committed at these recorded indices
 	// thus wake up corresponding RPC request and fail them to force client retry.
-	kv.pendingRequests[index] = RequestInfo{requestId: id, failCh: failCh}
+	kv.pendingRequests[index] = RequestInfo{RequestId: id, FailCh: failCh}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -225,7 +225,7 @@ func (kv *KVServer) FailAllPendingRequests() {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for k, v := range kv.pendingRequests {
-		v.failCh <- true
+		v.FailCh <- true
 		delete(kv.pendingRequests, k)
 	}
 }
@@ -235,8 +235,8 @@ func (kv *KVServer) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	info, ok := kv.pendingRequests[cmd.CommandIndex]
-	if ok && info.requestId != op.RequestId() {
-		info.failCh <- true
+	if ok && info.RequestId != op.RequestId() {
+		info.FailCh <- true
 	}
 	delete(kv.pendingRequests, cmd.CommandIndex)
 }

@@ -930,12 +930,14 @@ func (rf *Raft) ApplyEntryLocked() {
 		})
 		rf.lastApplied = i
 	}
-	rf.condApplyMsg.Signal()
-	TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
-		"inclusiveStart": lastApplied + 1,
-		"inclusiveEnd":   commitIndex,
-		"entries":        fmt.Sprintf("%v", entries),
-	}))
+	if len(entries) > 0 {
+		rf.condApplyMsg.Signal()
+		TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+			"inclusiveStart": lastApplied + 1,
+			"inclusiveEnd":   commitIndex,
+			"entries":        fmt.Sprintf("%v", entries),
+		}))
+	}
 }
 
 func (rf *Raft) DaemonApplyMsg() {

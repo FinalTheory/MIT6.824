@@ -1,53 +1,426 @@
 package shardctrler
 
-
-import "6.5840/raft"
+import (
+	"6.5840/kvraft"
+	"6.5840/raft"
+	"fmt"
+	"log"
+	"slices"
+	"sync/atomic"
+	"time"
+)
 import "6.5840/labrpc"
 import "sync"
 import "6.5840/labgob"
 
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type ShardCtrler struct {
 	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
+	dead    int32 // set by Kill()
 
-	// Your data here.
+	rwLock     sync.RWMutex
+	dedupTable map[int64]int32
+	valueTable map[int64]*Config
 
-	configs []Config // indexed by config num
+	pendingRequests  map[int]kvraft.RequestInfo
+	lastAppliedIndex int
+	configs          []Config // indexed by config num
+
+	// states related to gracefully kill
+	killCh chan bool
 }
-
 
 type Op struct {
-	// Your data here.
+	Type       string
+	ToClientCh chan *Config
+	From       int
+	Join       JoinArgs
+	Move       MoveArgs
+	Leave      LeaveArgs
+	Query      QueryArgs
 }
 
+func (op *Op) ClientId() int64 {
+	switch op.Type {
+	case JoinOp:
+		return op.Join.ClientId
+	case LeaveOp:
+		return op.Leave.ClientId
+	case MoveOp:
+		return op.Move.ClientId
+	case QueryOp:
+		return op.Query.ClientId
+	}
+	panic("Invalid op type")
+}
+
+func (op *Op) SeqNumber() int32 {
+	switch op.Type {
+	case JoinOp:
+		return op.Join.SeqNumber
+	case LeaveOp:
+		return op.Leave.SeqNumber
+	case MoveOp:
+		return op.Move.SeqNumber
+	case QueryOp:
+		return op.Query.SeqNumber
+	}
+	panic("Invalid op type")
+}
+
+func (op *Op) RequestId() kvraft.RequestId {
+	return kvraft.RequestId{ClientId: op.ClientId(), SeqNumber: op.SeqNumber()}
+}
+
+// ShouldStartCommand returns whether to accept this RPC
+func (sc *ShardCtrler) ShouldStartCommand(clientId int64, newSeq int32, err *Err, wrongLeader *bool, value *Config) bool {
+	_, isLeader := sc.rf.GetState()
+	if !isLeader {
+		*wrongLeader = true
+		return false
+	}
+	sc.rwLock.RLock()
+	defer sc.rwLock.RUnlock()
+	seq, ok := sc.dedupTable[clientId]
+	if ok {
+		switch {
+		case newSeq == seq:
+			*err = OK
+			if value != nil {
+				*value = *sc.valueTable[clientId]
+			}
+			return false
+		case newSeq < seq:
+			*err = kvraft.ErrStaleRequest
+			return false
+		case newSeq > seq:
+			return true
+		}
+	}
+	// we should start command if client ID not in dedup table
+	return true
+}
+
+func (sc *ShardCtrler) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh chan bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
+	// and then it's no longer a leader, thus these entries are finally overridden by another new leader
+	// at commit stage, current server will detect different operations are committed at these recorded indices
+	// thus wake up corresponding RPC request and fail them to force client retry.
+	sc.pendingRequests[index] = kvraft.RequestInfo{RequestId: id, FailCh: failCh}
+}
+
+func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value *Config) {
+	requestId := op.RequestId()
+	if !sc.ShouldStartCommand(requestId.ClientId, requestId.SeqNumber, err, wrongLeader, value) {
+		return
+	}
+	failCh := make(chan bool, 1)
+	op.ToClientCh = make(chan *Config, 1)
+	op.From = sc.me
+
+	index, _, isLeader := sc.rf.Start(op)
+	if isLeader {
+		DPrintf("[%s][%d] RequestHandler start index=%d ClientId:%d SeqNumber:%d", op.Type, sc.me, index, requestId.ClientId, requestId.SeqNumber)
+		defer DPrintf("[%s][%d] RequestHandler end index=%d ClientId:%d SeqNumber:%d", op.Type, sc.me, index, requestId.ClientId, requestId.SeqNumber)
+		sc.RecordRequestAtIndex(index, kvraft.RequestId{ClientId: requestId.ClientId, SeqNumber: requestId.SeqNumber}, failCh)
+		*wrongLeader = false
+		// block until it's committed
+		select {
+		case <-failCh:
+			*err = kvraft.ErrLostLeadership
+		case cfg := <-op.ToClientCh:
+			*err = OK
+			if value != nil {
+				*value = *cfg
+			}
+		case <-time.After(time.Second * kvraft.RPCTimeout):
+			*err = kvraft.ErrTimeOut
+		}
+	} else {
+		*wrongLeader = true
+	}
+}
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
+	op := Op{
+		Type: JoinOp,
+		Join: *args,
+	}
+	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, nil)
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
+	op := Op{
+		Type:  LeaveOp,
+		Leave: *args,
+	}
+	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, nil)
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
+	op := Op{
+		Type: MoveOp,
+		Move: *args,
+	}
+	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, nil)
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
+	op := Op{
+		Type:  QueryOp,
+		Query: *args,
+	}
+	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, &reply.Config)
 }
-
 
 // the tester calls Kill() when a ShardCtrler instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (sc *ShardCtrler) Kill() {
+	atomic.StoreInt32(&sc.dead, 1)
 	sc.rf.Kill()
-	// Your code here, if desired.
+	sc.killCh <- true
+}
+
+func (sc *ShardCtrler) killed() bool {
+	z := atomic.LoadInt32(&sc.dead)
+	return z == 1
+}
+
+func (sc *ShardCtrler) OperationExecutor() {
+	for !sc.killed() {
+		DPrintf("[%d] waiting for op", sc.me)
+		select {
+		// receives committed raft log entry
+		case cmd := <-sc.applyCh:
+			if cmd.TermChanged {
+				sc.FailAllPendingRequests()
+				continue
+			}
+			if !cmd.CommandValid || cmd.CommandIndex <= sc.lastAppliedIndex {
+				continue
+			}
+			sc.FailConflictPendingRequests(cmd)
+			op := cmd.Command.(Op)
+			DPrintf("[%d] Apply command [%d] [%+v]", sc.me, cmd.CommandIndex, op)
+			result := sc.ApplyOperation(op)
+			sc.lastAppliedIndex = cmd.CommandIndex
+			if op.From == sc.me && op.ToClientCh != nil {
+				op.ToClientCh <- result
+			}
+		case killed := <-sc.killCh:
+			if killed {
+				break
+			}
+		}
+	}
+}
+
+func (sc *ShardCtrler) FailAllPendingRequests() {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	for k, v := range sc.pendingRequests {
+		v.FailCh <- true
+		delete(sc.pendingRequests, k)
+	}
+}
+
+func (sc *ShardCtrler) FailConflictPendingRequests(cmd raft.ApplyMsg) {
+	op := cmd.Command.(Op)
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	info, ok := sc.pendingRequests[cmd.CommandIndex]
+	if ok && info.RequestId != op.RequestId() {
+		info.FailCh <- true
+	}
+	delete(sc.pendingRequests, cmd.CommandIndex)
+}
+
+func (sc *ShardCtrler) ApplyOperation(op Op) *Config {
+	emptyConfig := Config{}
+	result := &emptyConfig
+	seq, ok := sc.dedupTable[op.ClientId()]
+	if ok && op.SeqNumber() == seq {
+		return sc.valueTable[op.ClientId()]
+	}
+	sc.rwLock.Lock()
+	defer sc.rwLock.Unlock()
+	switch op.Type {
+	case JoinOp:
+		sc.JoinImpl(&op.Join)
+	case LeaveOp:
+		sc.LeaveImpl(&op.Leave)
+	case MoveOp:
+		sc.MoveImpl(&op.Move)
+	case QueryOp:
+		result = sc.QueryImpl(&op.Query)
+	default:
+		panic("Invalid op type")
+	}
+	raft.TraceInstant("Apply", sc.me, time.Now().UnixMicro(), map[string]any{
+		"op":           fmt.Sprintf("%+v", op),
+		"latestConfig": fmt.Sprintf("%+v", sc.configs[len(sc.configs)-1]),
+	})
+	sc.dedupTable[op.ClientId()] = op.SeqNumber()
+	sc.valueTable[op.ClientId()] = result
+	return result
+}
+
+func copyConfig(src *Config) *Config {
+	dst := Config{}
+	dst.Num = src.Num
+	for i := 0; i < NShards; i++ {
+		dst.Shards[i] = src.Shards[i]
+	}
+	dst.Groups = make(map[int][]string)
+	for k, v := range src.Groups {
+		values := make([]string, len(v))
+		copy(values, v)
+		dst.Groups[k] = values
+	}
+	return &dst
+}
+
+func ReBalance(cfg *Config) {
+	DPrintf("Before Rebalance: %+v", *cfg)
+	if len(cfg.Groups) == 0 {
+		return
+	}
+	// most groups should own `expected` shards
+	expected := NShards / len(cfg.Groups)
+	// num of groups allowed to have `expected + 1` shards due to remainderGroups
+	remainder := NShards % len(cfg.Groups)
+	// and a set to deduplicate those GIDs
+	remainderGroups := make(map[int]bool)
+
+	// 0. Collect all GIDs
+	gids := make([]int, 0, len(cfg.Groups))
+	for gid, _ := range cfg.Groups {
+		gids = append(gids, gid)
+	}
+	slices.Sort(gids)
+	// 1. Count shards by GID
+	gidToShards := make(map[int]int)
+	for _, gid := range gids {
+		gidToShards[gid] = 0
+	}
+	for i := 0; i < NShards; i++ {
+		if cfg.Shards[i] > 0 {
+			gidToShards[cfg.Shards[i]] += 1
+		}
+	}
+	// 2. Collect shards that needs to be re-allocated
+	shardsToAssign := make([]int, 0, NShards)
+	for i := 0; i < NShards; i++ {
+		gid := &cfg.Shards[i]
+		if *gid <= 0 {
+			shardsToAssign = append(shardsToAssign, i)
+			*gid = 0
+		} else {
+			if gidToShards[*gid] > expected {
+				_, exists := remainderGroups[*gid]
+				if gidToShards[*gid] == expected+1 && (len(remainderGroups) < remainder || exists) {
+					remainderGroups[*gid] = true
+					continue
+				}
+				shardsToAssign = append(shardsToAssign, i)
+				gidToShards[*gid] -= 1
+				*gid = 0
+			}
+		}
+	}
+	// 3. Allocate the dangling shards
+	for len(shardsToAssign) > 0 {
+		for _, gid := range gids {
+			if len(shardsToAssign) == 0 {
+				break
+			}
+			allowOneMore := gidToShards[gid] == expected && len(remainderGroups) < remainder
+			if gidToShards[gid] < expected || allowOneMore {
+				if allowOneMore {
+					remainderGroups[gid] = true
+				}
+				shard := shardsToAssign[0]
+				shardsToAssign = shardsToAssign[1:]
+				cfg.Shards[shard] = gid
+				gidToShards[gid] += 1
+			}
+		}
+	}
+	// 4. Additional check
+	for i := 0; i < NShards; i++ {
+		if cfg.Shards[i] == 0 {
+			panic(fmt.Sprintf("Shard %d is not allocated!", i))
+		}
+	}
+	DPrintf("After Rebalance: %+v %v", *cfg, gidToShards)
+}
+
+func (sc *ShardCtrler) JoinImpl(args *JoinArgs) {
+	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
+	cfg.Num += 1
+	for gid, servers := range args.Servers {
+		_, ok := cfg.Groups[gid]
+		if ok {
+			// TODO: need error handling here if it happens
+			panic(fmt.Sprintf("[%d] Redundant GID %d", sc.me, gid))
+		}
+		cfg.Groups[gid] = servers
+	}
+	ReBalance(cfg)
+	sc.configs = append(sc.configs, *cfg)
+}
+
+func (sc *ShardCtrler) LeaveImpl(args *LeaveArgs) {
+	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
+	cfg.Num += 1
+	for _, gid := range args.GIDs {
+		delete(cfg.Groups, gid)
+	}
+	validGID := -1
+	for i := 0; i < NShards; i++ {
+		if _, ok := cfg.Groups[cfg.Shards[i]]; ok {
+			validGID = cfg.Shards[i]
+			break
+		}
+	}
+	for i := 0; i < NShards; i++ {
+		if _, ok := cfg.Groups[cfg.Shards[i]]; !ok {
+			cfg.Shards[i] = validGID
+		}
+	}
+	ReBalance(cfg)
+	sc.configs = append(sc.configs, *cfg)
+}
+
+func (sc *ShardCtrler) MoveImpl(args *MoveArgs) {
+	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
+	cfg.Num += 1
+	cfg.Shards[args.Shard] = args.GID
+	ReBalance(cfg)
+	sc.configs = append(sc.configs, *cfg)
+}
+
+func (sc *ShardCtrler) QueryImpl(args *QueryArgs) *Config {
+	i := args.Num
+	if args.Num < 0 || args.Num >= len(sc.configs) {
+		i = len(sc.configs) - 1
+	}
+	return copyConfig(&sc.configs[i])
 }
 
 // needed by shardkv tester
@@ -62,15 +435,20 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
 	sc := new(ShardCtrler)
 	sc.me = me
-
 	sc.configs = make([]Config, 1)
+	sc.configs[0].Num = 0
 	sc.configs[0].Groups = map[int][]string{}
-
+	for i := 0; i < NShards; i++ {
+		sc.configs[0].Shards[i] = 0
+	}
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
-
-	// Your code here.
-
+	sc.killCh = make(chan bool, 10)
+	sc.lastAppliedIndex = 0
+	sc.dedupTable = make(map[int64]int32)
+	sc.valueTable = make(map[int64]*Config)
+	sc.pendingRequests = make(map[int]kvraft.RequestInfo)
+	go sc.OperationExecutor()
 	return sc
 }

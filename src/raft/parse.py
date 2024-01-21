@@ -43,7 +43,7 @@ def work(fname, events):
                 }
             )
     with open(fname + ".new", "w") as f:
-        f.write(json.dumps(results, indent=4))
+        f.write(json.dumps(results))
 
 
 if __name__ == "__main__":

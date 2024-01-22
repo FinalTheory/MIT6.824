@@ -76,11 +76,11 @@ type KVServer struct {
 
 // ShouldStartCommand returns whether to accept this RPC
 func (kv *KVServer) ShouldStartCommand(clientId int64, newSeq int32, err *Err, value *string) bool {
-	//_, isLeader := kv.rf.GetState()
-	//if !isLeader {
-	//	*err = ErrWrongLeader
-	//	return false
-	//}
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		*err = ErrWrongLeader
+		return false
+	}
 	kv.rwLock.RLock()
 	defer kv.rwLock.RUnlock()
 	seq, ok := kv.dedupTable[clientId]
@@ -194,10 +194,13 @@ func (kv *KVServer) OperationExecutor() {
 				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
 			}
-			if !cmd.CommandValid || cmd.CommandIndex <= kv.lastAppliedIndex {
+			if !cmd.CommandValid {
 				continue
 			}
 			kv.FailConflictPendingRequests(cmd)
+			if cmd.CommandIndex <= kv.lastAppliedIndex {
+				continue
+			}
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", kv.me, cmd.CommandIndex, op)
 			result := kv.ApplyOperation(op)

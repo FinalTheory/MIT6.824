@@ -211,10 +211,13 @@ func (sc *ShardCtrler) OperationExecutor() {
 				sc.FailAllPendingRequests()
 				continue
 			}
-			if !cmd.CommandValid || cmd.CommandIndex <= sc.lastAppliedIndex {
+			if !cmd.CommandValid {
 				continue
 			}
 			sc.FailConflictPendingRequests(cmd)
+			if cmd.CommandIndex <= sc.lastAppliedIndex {
+				continue
+			}
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", sc.me, cmd.CommandIndex, op)
 			result := sc.ApplyOperation(op)

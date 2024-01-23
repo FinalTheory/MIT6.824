@@ -112,7 +112,7 @@ func (sc *ShardCtrler) ShouldStartCommand(clientId int64, newSeq int32, err *Err
 	return true
 }
 
-func (sc *ShardCtrler) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh chan bool) {
+func (sc *ShardCtrler) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh chan kvraft.Err) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
@@ -127,7 +127,7 @@ func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value 
 	if !sc.ShouldStartCommand(requestId.ClientId, requestId.SeqNumber, err, wrongLeader, value) {
 		return
 	}
-	failCh := make(chan bool, 1)
+	failCh := make(chan kvraft.Err, 1)
 	op.ToClientCh = make(chan *Config, 1)
 	op.From = sc.me
 
@@ -139,8 +139,8 @@ func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value 
 		*wrongLeader = false
 		// block until it's committed
 		select {
-		case <-failCh:
-			*err = kvraft.ErrLostLeadership
+		case e := <-failCh:
+			*err = Err(e)
 		case cfg := <-op.ToClientCh:
 			*err = OK
 			if value != nil {
@@ -150,6 +150,7 @@ func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value 
 			*err = kvraft.ErrTimeOut
 		}
 	} else {
+		*err = kvraft.ErrWrongLeader
 		*wrongLeader = true
 	}
 }
@@ -194,6 +195,7 @@ func (sc *ShardCtrler) Kill() {
 	atomic.StoreInt32(&sc.dead, 1)
 	sc.rf.Kill()
 	sc.killCh <- true
+	sc.FailAllPendingRequests(kvraft.ErrKilled)
 }
 
 func (sc *ShardCtrler) killed() bool {
@@ -208,7 +210,7 @@ func (sc *ShardCtrler) OperationExecutor() {
 		// receives committed raft log entry
 		case cmd := <-sc.applyCh:
 			if cmd.TermChanged {
-				sc.FailAllPendingRequests()
+				sc.FailAllPendingRequests(kvraft.ErrLostLeadership)
 				continue
 			}
 			if !cmd.CommandValid {
@@ -233,11 +235,11 @@ func (sc *ShardCtrler) OperationExecutor() {
 	}
 }
 
-func (sc *ShardCtrler) FailAllPendingRequests() {
+func (sc *ShardCtrler) FailAllPendingRequests(err kvraft.Err) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	for k, v := range sc.pendingRequests {
-		v.FailCh <- true
+		v.FailCh <- err
 		delete(sc.pendingRequests, k)
 	}
 }
@@ -248,7 +250,7 @@ func (sc *ShardCtrler) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 	defer sc.mu.Unlock()
 	info, ok := sc.pendingRequests[cmd.CommandIndex]
 	if ok && info.RequestId != op.RequestId() {
-		info.FailCh <- true
+		info.FailCh <- kvraft.ErrLostLeadership
 	}
 	delete(sc.pendingRequests, cmd.CommandIndex)
 }
@@ -274,7 +276,7 @@ func (sc *ShardCtrler) ApplyOperation(op Op) *Config {
 	default:
 		panic("Invalid op type")
 	}
-	raft.TraceInstant("Apply", sc.me, time.Now().UnixMicro(), map[string]any{
+	raft.TraceInstant("Apply", sc.me, 0, time.Now().UnixMicro(), map[string]any{
 		"op":           fmt.Sprintf("%+v", op),
 		"latestConfig": fmt.Sprintf("%+v", sc.configs[len(sc.configs)-1]),
 	})

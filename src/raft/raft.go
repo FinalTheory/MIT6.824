@@ -251,7 +251,8 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	GID       int
+	dead      int32 // set by Kill()
 	applyCh   *chan ApplyMsg
 
 	// Your Data here (2A, 2B, 2C).
@@ -272,6 +273,7 @@ type Raft struct {
 	log      LogContainer
 	snapshot []byte
 
+	serverStartTime int64
 	lastReceivedRPC int64
 	electionTimeout int64
 
@@ -319,6 +321,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 func (rf *Raft) GetTraceState() map[string]any {
 	return merge(rf.log.GetTraceState(), map[string]any{
+		"GID":              rf.GID,
 		"raft.currentTerm": rf.currentTerm,
 		"raft.commitIndex": rf.commitIndex,
 		"raft.lastApplied": rf.lastApplied,
@@ -378,7 +381,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		if idx < rf.log.StartFrom {
 			return
 		}
-		TraceInstant("Snapshot", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+		TraceInstant("Snapshot", rf.me, rf.GID, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 			"index":        idx,
 			"snapshotSize": len(s),
 		}))
@@ -466,7 +469,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
 				rf.lastReceivedRPC = time.Now().UnixMilli()
-				TraceInstant("Vote", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+				TraceInstant("Vote", rf.me, rf.GID, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 					"voteFor":              args.CandidateId,
 					"selfLastLogInfo":      fmt.Sprintf("%v", rf.GetLastLogInfoLocked()),
 					"candidateLastLogInfo": fmt.Sprintf("%v", candidateLastLogInfo),
@@ -488,7 +491,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		eventName = "Heartbeat"
 	}
 	defer func() {
-		TraceInstant(eventName, rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+		TraceInstant(eventName, rf.me, rf.GID, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 			"args.PrevLogIndex": args.PrevLogIndex,
 			"args.PrevLogTerm":  args.PrevLogTerm,
 			"args.Term":         args.Term,
@@ -565,7 +568,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.Lock()
 	defer rf.Unlock()
 	rf.HandleTermUpdateLocked(args.Term)
-	TraceInstant("InstallSnapshot", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+	TraceInstant("InstallSnapshot", rf.me, rf.GID, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 		"args.LastIncludedIndex": args.LastIncludedIndex,
 		"args.LastIncludedTerm":  args.LastIncludedTerm,
 		"args.Term":              args.Term,
@@ -710,7 +713,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before SendLogDaemon blocked on wait.
 	rf.condAppendEntries.Broadcast()
 	rf.persist()
-	TraceInstant("StartCommand", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+	TraceInstant("StartCommand", rf.me, rf.GID, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 		"entry": fmt.Sprintf("%v", command),
 	}))
 	return index + 1, term, isLeader
@@ -932,7 +935,7 @@ func (rf *Raft) ApplyEntryLocked() {
 	}
 	if len(entries) > 0 {
 		rf.condApplyMsg.Signal()
-		TraceInstant("Commit", rf.me, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+		TraceInstant("Commit", rf.me, rf.GID, time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 			"inclusiveStart": lastApplied + 1,
 			"inclusiveEnd":   commitIndex,
 			"entries":        fmt.Sprintf("%v", entries),
@@ -1001,7 +1004,7 @@ func (rf *Raft) Kill() {
 			time.Sleep(time.Millisecond * 100)
 			timeout := int64(10)
 			if time.Now().UnixMilli()-start > timeout*1000 {
-				log.Printf("Spent more than %ds to kill %p", timeout, rf)
+				log.Printf("Spent more than %ds to kill Raft %p", timeout, rf)
 				fid, _ := os.Create("goroutine.txt")
 				pprof.Lookup("goroutine").WriteTo(fid, 2)
 			}
@@ -1020,6 +1023,10 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		rf.electionTimeout = 200 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(rf.electionTimeout) * time.Millisecond)
+		if rf.serverStartTime != 0 {
+			TraceEventBegin(true, "Follower", rf.me, rf.GID, rf.serverStartTime, nil)
+			rf.serverStartTime = 0
+		}
 		// Check if a leader election should be started.
 		// this holds true on start
 		rf.TryStartNewElection()
@@ -1043,7 +1050,7 @@ func (rf *Raft) TryStartNewElection() {
 	}
 	// it will be persisted during switch to candidate
 	rf.currentTerm += 1
-	TraceInstant("NewElection", rf.me, time.Now().UnixMicro(), rf.GetTraceState())
+	TraceInstant("NewElection", rf.me, rf.GID, time.Now().UnixMicro(), rf.GetTraceState())
 	rf.SwitchToCandidate()
 	info := rf.GetLastLogInfoLocked()
 
@@ -1087,10 +1094,10 @@ func (rf *Raft) SwitchToCandidate() {
 		panic("Leader can not become candidate")
 	}
 	if rf.role == Follower {
-		TraceEventEnd(!rf.killed(), Follower.String(), rf.me, now, nil)
+		TraceEventEnd(!rf.killed(), Follower.String(), rf.me, rf.GID, now, nil)
 	}
 	if rf.role != Candidate {
-		TraceEventBegin(!rf.killed(), Candidate.String(), rf.me, now, rf.GetTraceState())
+		TraceEventBegin(!rf.killed(), Candidate.String(), rf.me, rf.GID, now, rf.GetTraceState())
 	}
 	rf.role = Candidate
 	rf.voteCount = 1
@@ -1101,13 +1108,13 @@ func (rf *Raft) SwitchToCandidate() {
 func (rf *Raft) SwitchToFollower() {
 	now := time.Now().UnixMicro()
 	if rf.role == Leader {
-		TraceEventEnd(!rf.killed(), Leader.String(), rf.me, now, nil)
+		TraceEventEnd(!rf.killed(), Leader.String(), rf.me, rf.GID, now, nil)
 	}
 	if rf.role == Candidate {
-		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, now, nil)
+		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, rf.GID, now, nil)
 	}
 	if rf.role != Follower {
-		TraceEventBegin(!rf.killed(), Follower.String(), rf.me, now, rf.GetTraceState())
+		TraceEventBegin(!rf.killed(), Follower.String(), rf.me, rf.GID, now, rf.GetTraceState())
 	}
 	rf.role = Follower
 	rf.voteCount = 0
@@ -1121,11 +1128,11 @@ func (rf *Raft) SwitchToLeader() {
 	}
 	now := time.Now().UnixMicro()
 	if rf.role == Candidate {
-		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, now, nil)
+		TraceEventEnd(!rf.killed(), Candidate.String(), rf.me, rf.GID, now, nil)
 	}
 	state := rf.GetTraceState()
 	state["voteCount"] = rf.voteCount
-	TraceEventBegin(!rf.killed(), Leader.String(), rf.me, now, state)
+	TraceEventBegin(!rf.killed(), Leader.String(), rf.me, rf.GID, now, state)
 	rf.role = Leader
 	rf.voteCount = 0
 	for i := 0; i < len(rf.peers); i++ {
@@ -1188,8 +1195,8 @@ func (rf *Raft) MajorityNum() int {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	TraceEventBegin(true, "Follower", me, time.Now().UnixMicro(), nil)
 	rf := &Raft{}
+	rf.serverStartTime = time.Now().UnixMicro()
 	rf.applyCh = &applyCh
 	// in case Kill() is called more than once or more goroutines needs to be terminated
 	rf.killChSize = 16

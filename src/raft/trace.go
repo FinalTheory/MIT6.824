@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Trace = false
+const Trace = true
 
 var gMutex sync.Mutex
 var gFile *os.File = nil
@@ -44,7 +44,7 @@ func CloseTraceFileLocked() {
 	gFile = nil
 }
 
-func TraceEventBeginEndImpl(name string, server int, timestamp int64, args map[string]any, etype string) {
+func TraceEventBeginEndImpl(name string, server int, group int, timestamp int64, args map[string]any, etype string) {
 	if !Trace {
 		return
 	}
@@ -56,7 +56,7 @@ func TraceEventBeginEndImpl(name string, server int, timestamp int64, args map[s
 	logitem := map[string]any{
 		"name": name,
 		"ph":   etype,
-		"pid":  0,
+		"pid":  group,
 		"tid":  server,
 		"ts":   timestamp - gStart,
 		"args": args,
@@ -66,7 +66,7 @@ func TraceEventBeginEndImpl(name string, server int, timestamp int64, args map[s
 	gFile.WriteString(",\n")
 }
 
-func TraceInstant(name string, server int, timestamp int64, args map[string]any) {
+func TraceInstant(name string, server int, group int, timestamp int64, args map[string]any) {
 	if !Trace {
 		return
 	}
@@ -78,7 +78,7 @@ func TraceInstant(name string, server int, timestamp int64, args map[string]any)
 	logitem := map[string]any{
 		"name": name,
 		"ph":   "i",
-		"pid":  0,
+		"pid":  group,
 		"tid":  server,
 		"ts":   timestamp - gStart,
 		"args": args,
@@ -88,14 +88,14 @@ func TraceInstant(name string, server int, timestamp int64, args map[string]any)
 	gFile.WriteString(",\n")
 }
 
-func TraceEventBegin(flag bool, name string, server int, timestamp int64, args map[string]any) {
+func TraceEventBegin(flag bool, name string, server int, group int, timestamp int64, args map[string]any) {
 	if flag {
-		TraceEventBeginEndImpl(name, server, timestamp, args, "B")
+		TraceEventBeginEndImpl(name, server, group, timestamp, args, "B")
 	}
 }
 
-func TraceEventEnd(flag bool, name string, server int, timestamp int64, args map[string]any) {
+func TraceEventEnd(flag bool, name string, server int, group int, timestamp int64, args map[string]any) {
 	if flag {
-		TraceEventBeginEndImpl(name, server, timestamp, args, "E")
+		TraceEventBeginEndImpl(name, server, group, timestamp, args, "E")
 	}
 }

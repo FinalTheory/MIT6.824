@@ -5,6 +5,7 @@ package shardctrler
 //
 
 import (
+	"6.5840/kvraft"
 	"6.5840/labrpc"
 	"sync/atomic"
 )
@@ -44,6 +45,9 @@ func (ck *Clerk) Query(num int) Config {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
+				return reply.Config
+			}
+			if ok && reply.Err == kvraft.ErrKilled {
 				return reply.Config
 			}
 		}

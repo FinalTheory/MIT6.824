@@ -64,7 +64,7 @@ var ncpu_once sync.Once
 
 func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 	InitNewTrace()
-	TraceInstant("Start", 0, time.Now().UnixMicro(), nil)
+	TraceInstant("Start", 0, 0, time.Now().UnixMicro(), nil)
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")

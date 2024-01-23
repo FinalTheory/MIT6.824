@@ -336,6 +336,8 @@ func (cfg *config) leavem(gis []int) {
 var ncpu_once sync.Once
 
 func make_config(t *testing.T, n int, unreliable bool, maxraftstate int) *config {
+	raft.InitNewTrace()
+	raft.TraceInstant("Start", 0, 0, time.Now().UnixMicro(), nil)
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")

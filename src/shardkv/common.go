@@ -51,8 +51,20 @@ type GetReply struct {
 type InstallShardArgs struct {
 	Shard int
 	Data  map[string]string
+	Num   int
+	// for logging purpose
+	From int
 }
 
 type InstallShardReply struct {
 	Success bool
+}
+
+type ShardInfo struct {
+	Shard int
+	Num   int
+}
+
+func (args *InstallShardArgs) ShardInfo() ShardInfo {
+	return ShardInfo{Shard: args.Shard, Num: args.Num}
 }

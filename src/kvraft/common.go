@@ -6,6 +6,7 @@ const (
 	ErrTimeOut        = "ErrTimeOut"
 	ErrStaleRequest   = "ErrStaleRequest"
 	ErrLostLeadership = "ErrLostLeadership"
+	ErrKilled         = "ErrKilled"
 )
 
 type Err string

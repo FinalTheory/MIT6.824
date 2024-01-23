@@ -46,7 +46,7 @@ type RequestId struct {
 
 type RequestInfo struct {
 	RequestId RequestId
-	FailCh    chan bool
+	FailCh    chan Err
 }
 
 type KVServer struct {
@@ -103,7 +103,7 @@ func (kv *KVServer) ShouldStartCommand(clientId int64, newSeq int32, err *Err, v
 	return true
 }
 
-func (kv *KVServer) RecordRequestAtIndex(index int, id RequestId, failCh chan bool) {
+func (kv *KVServer) RecordRequestAtIndex(index int, id RequestId, failCh chan Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
@@ -118,7 +118,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	clientCh := make(chan string, 1)
-	failCh := make(chan bool, 1)
+	failCh := make(chan Err, 1)
 	index, _, isLeader := kv.rf.Start(Op{
 		Key:        args.Key,
 		Op:         GetOp,
@@ -133,8 +133,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.RecordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		// block until it's committed
 		select {
-		case <-failCh:
-			reply.Err = ErrLostLeadership
+		case err := <-failCh:
+			reply.Err = err
 		case result := <-clientCh:
 			reply.Value = result
 			reply.Err = OK
@@ -151,7 +151,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	clientCh := make(chan string, 1)
-	failCh := make(chan bool, 1)
+	failCh := make(chan Err, 1)
 	index, _, isLeader := kv.rf.Start(Op{
 		Key:        args.Key,
 		Value:      args.Value,
@@ -167,8 +167,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.RecordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		// block until it's committed
 		select {
-		case <-failCh:
-			reply.Err = ErrLostLeadership
+		case err := <-failCh:
+			reply.Err = err
 		case <-clientCh:
 			reply.Err = OK
 		case <-time.After(time.Second * RPCTimeout):
@@ -186,7 +186,7 @@ func (kv *KVServer) OperationExecutor() {
 		// receives committed raft log entry
 		case cmd := <-kv.applyCh:
 			if cmd.TermChanged {
-				kv.FailAllPendingRequests()
+				kv.FailAllPendingRequests(ErrLostLeadership)
 				continue
 			}
 			if cmd.SnapshotValid && cmd.SnapshotIndex > kv.lastAppliedIndex {
@@ -224,11 +224,11 @@ func (kv *KVServer) OperationExecutor() {
 	kv.executorKilled.Store(true)
 }
 
-func (kv *KVServer) FailAllPendingRequests() {
+func (kv *KVServer) FailAllPendingRequests(err Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for k, v := range kv.pendingRequests {
-		v.FailCh <- true
+		v.FailCh <- err
 		delete(kv.pendingRequests, k)
 	}
 }
@@ -239,7 +239,7 @@ func (kv *KVServer) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 	defer kv.mu.Unlock()
 	info, ok := kv.pendingRequests[cmd.CommandIndex]
 	if ok && info.RequestId != op.RequestId() {
-		info.FailCh <- true
+		info.FailCh <- ErrLostLeadership
 	}
 	delete(kv.pendingRequests, cmd.CommandIndex)
 }
@@ -271,7 +271,7 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 			result = value
 		}
 	}
-	raft.TraceInstant("Apply", kv.me, time.Now().UnixMicro(), map[string]any{
+	raft.TraceInstant("Apply", kv.me, 0, time.Now().UnixMicro(), map[string]any{
 		"op":    fmt.Sprintf("%+v", op),
 		"state": kv.state[op.Key],
 	})
@@ -332,6 +332,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	kv.killCh <- true
+	kv.FailAllPendingRequests(ErrKilled)
 	go func(start int64) {
 		for !kv.CheckKillComplete() {
 			time.Sleep(time.Millisecond * 100)

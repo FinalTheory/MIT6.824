@@ -73,10 +73,10 @@ type DedupEntry struct {
 
 type ShardKV struct {
 	me           int
+	gid          int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
 	make_end     func(string) *labrpc.ClientEnd
-	gid          int
 	mck          *shardctrler.Clerk
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
@@ -86,7 +86,8 @@ type ShardKV struct {
 	pendingRequests map[int]kvraft.RequestInfo
 
 	// access to K/V state is single threaded, thus no lock needed
-	state map[string]string
+	state            map[string]string
+	lastAppliedIndex int
 
 	rwLock sync.RWMutex
 	dedup  map[DedupKey]DedupEntry
@@ -106,8 +107,6 @@ type ShardKV struct {
 	executorKilled      atomic.Bool
 	configFetcherKilled atomic.Bool
 	sendShardsKilled    atomic.Bool
-
-	lastAppliedIndex int
 }
 
 func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -159,6 +158,9 @@ func (kv *ShardKV) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh c
 }
 
 func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply) {
+	if args.Num < kv.config.Load().Num {
+		return
+	}
 	_, _, isLeader := kv.rf.Start(Op{
 		Op:        InstallShard,
 		From:      kv.me,
@@ -209,8 +211,12 @@ func (kv *ShardKV) HandleInstallShard(op Op) {
 			// if not waiting for this shard, this might be a duplication and can be ignored
 			return
 		}
+	} else {
+		if op.ShardArgs.Num == cfg.Num {
+			panic(fmt.Sprintf("unexpected %+v, %+v", op, cfg))
+		}
 	}
-	// if in current config we're not serving this shard at all, simply record it for future use
+	// if in current config we're not serving this shard at all, or if the config num of this shard data is not active yet, we simply record it for future use
 	kv.pendingShards[op.ShardArgs.ShardInfo()] = op.ShardArgs
 }
 
@@ -314,11 +320,7 @@ func (kv *ShardKV) DaemonConfigFetcher() {
 }
 
 func (kv *ShardKV) SendShardImpl(data ShardData) {
-	start := time.Now().UnixMilli()
 	for !kv.killed() {
-		if time.Now().UnixMilli()-start > kvraft.RPCTimeout*1000 {
-			panic(fmt.Sprintf("Failed to send shard to replica group, servers: %v", data.Servers))
-		}
 		for _, server := range data.Servers {
 			if kv.killed() {
 				return
@@ -587,10 +589,11 @@ func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
 	if err := e.Encode(kv.dedup); err != nil {
 		log.Fatal(err)
 	}
-	// config MUST be persisted, otherwise we'll serve wrong shard after restart
+	// config MUST be persisted, otherwise we'll have to apply all historical configs before able to serve
 	if err := e.Encode(*kv.config.Load()); err != nil {
 		log.Fatal(err)
 	}
+	// all states affected by Raft commands should also be persisted
 	if err := e.Encode(kv.shardsToRecv); err != nil {
 		log.Fatal(err)
 	}

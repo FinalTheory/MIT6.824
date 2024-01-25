@@ -94,11 +94,12 @@ type ShardKV struct {
 
 	// states to send shards during migration
 	config         atomic.Pointer[shardctrler.Config]
+	skippedConfig  int
 	shardsToSend   []ShardData
 	muSendShards   sync.Mutex
 	condSendShards *sync.Cond
 	// states to handle shard migration
-	shardsToRecv  map[int]bool
+	shardsToRecv  map[int]int
 	pendingShards map[ShardInfo]InstallShardArgs
 
 	// states related to gracefully kill
@@ -159,6 +160,7 @@ func (kv *ShardKV) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh c
 
 func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply) {
 	if args.Num < kv.config.Load().Num {
+		reply.Success = true
 		return
 	}
 	_, _, isLeader := kv.rf.Start(Op{
@@ -190,19 +192,22 @@ func (kv *ShardKV) HandleInstallShard(op Op) {
 	if op.ShardArgs.Num < cfg.Num {
 		return
 	}
-	raft.TraceInstant("InstallShard", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
+	raft.TraceInstant(op.Op, kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
 		"GID":           kv.gid,
 		"op":            fmt.Sprintf("%+v", op),
 		"config":        fmt.Sprintf("%+v", *cfg),
-		"shardsToRecv":  fmt.Sprintf("%v", keys(kv.shardsToRecv)),
+		"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
 		"pendingShards": fmt.Sprintf("%v", keys(kv.pendingShards)),
 	})
 	// first check if we serve this shard in current config
 	if cfg.Shards[op.ShardArgs.Shard] == kv.gid {
 		// are we still waiting for this shard?
-		if _, ok := kv.shardsToRecv[op.ShardArgs.Shard]; ok {
+		if from, ok := kv.shardsToRecv[op.ShardArgs.Shard]; ok {
 			// we only apply the shard if it is for current config num
 			if op.ShardArgs.Num == cfg.Num {
+				if from != op.ShardArgs.From {
+					panic(fmt.Sprintf("Expected shard from %d, actual from %d", from, op.ShardArgs.From))
+				}
 				kv.AddShardToState(op.ShardArgs)
 				delete(kv.shardsToRecv, op.ShardArgs.Shard)
 				return
@@ -320,10 +325,14 @@ func (kv *ShardKV) DaemonConfigFetcher() {
 }
 
 func (kv *ShardKV) SendShardImpl(data ShardData) {
+	start := time.Now().UnixMilli()
 	for !kv.killed() {
 		for _, server := range data.Servers {
 			if kv.killed() {
 				return
+			}
+			if time.Now().UnixMilli()-start > kvraft.RPCTimeout*1000 {
+				panic("SendShardImpl timeout!")
 			}
 			srv := kv.make_end(server)
 			var reply InstallShardReply
@@ -405,6 +414,13 @@ func (kv *ShardKV) IsConfigChangeValid(op Op) bool {
 
 func (kv *ShardKV) HandleSendShard(op Op) {
 	data := ShardData{Arg: op.ShardArgs, Servers: op.Servers}
+	raft.TraceInstant(op.Op, kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
+		"GID":           kv.gid,
+		"op":            fmt.Sprintf("%+v", op),
+		"config":        fmt.Sprintf("%+v", *kv.config.Load()),
+		"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
+		"pendingShards": fmt.Sprintf("%v", keys(kv.pendingShards)),
+	})
 	// put requests into send queue
 	kv.muSendShards.Lock()
 	kv.shardsToSend = append(kv.shardsToSend, data)
@@ -415,11 +431,23 @@ func (kv *ShardKV) HandleSendShard(op Op) {
 func (kv *ShardKV) HandleConfigChange(op Op) {
 	// not lock needed here to access the state
 	// dedup for config change operation
-	if !kv.IsConfigChangeValid(op) {
-		return
-	}
 	activeConfig := kv.config.Load()
 	shardsToSend := make([]int, 0, shardctrler.NShards)
+	valid := kv.IsConfigChangeValid(op)
+	defer func() {
+		raft.TraceInstant(op.Op, kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
+			"GID":           kv.gid,
+			"valid":         valid,
+			"shardsToSend":  fmt.Sprintf("%v", shardsToSend),
+			"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
+			"pendingShards": fmt.Sprintf("%v", keys(kv.pendingShards)),
+			"activeConfig":  fmt.Sprintf("%+v", *kv.config.Load()),
+			"newConfig":     fmt.Sprintf("%+v", *op.NewConfig),
+		})
+	}()
+	if !valid {
+		return
+	}
 	for shard := 0; shard < shardctrler.NShards; shard++ {
 		if activeConfig.Shards[shard] == kv.gid && op.NewConfig.Shards[shard] != kv.gid {
 			shardsToSend = append(shardsToSend, shard)
@@ -432,7 +460,7 @@ func (kv *ShardKV) HandleConfigChange(op Op) {
 					kv.AddShardToState(data)
 					delete(kv.pendingShards, key)
 				} else {
-					kv.shardsToRecv[shard] = true
+					kv.shardsToRecv[shard] = activeConfig.Shards[shard]
 				}
 			}
 		}
@@ -440,14 +468,7 @@ func (kv *ShardKV) HandleConfigChange(op Op) {
 	if len(shardsToSend) != 0 {
 		kv.SendShards(shardsToSend, op.NewConfig)
 	}
-	raft.TraceInstant("ConfigChange", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
-		"GID":           kv.gid,
-		"shardsToSend":  fmt.Sprintf("%v", shardsToSend),
-		"shardsToRecv":  fmt.Sprintf("%v", keys(kv.shardsToRecv)),
-		"pendingShards": fmt.Sprintf("%v", keys(kv.pendingShards)),
-		"activeConfig":  fmt.Sprintf("%+v", *kv.config.Load()),
-		"newConfig":     fmt.Sprintf("%+v", *op.NewConfig),
-	})
+
 	kv.config.Store(op.NewConfig)
 }
 
@@ -614,7 +635,7 @@ func (kv *ShardKV) ReloadFromSnapshot(data []byte) {
 	var state map[string]string
 	var dedupTable map[DedupKey]DedupEntry
 	var cfg shardctrler.Config
-	var shardsToRecv map[int]bool
+	var shardsToRecv map[int]int
 	var pendingShards map[ShardInfo]InstallShardArgs
 	if d.Decode(&lastAppliedIndex) != nil || d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&cfg) != nil || d.Decode(&shardsToRecv) != nil || d.Decode(&pendingShards) != nil {
 		panic("Failed to reload persisted snapshot into application.")
@@ -709,7 +730,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.dedup = make(map[DedupKey]DedupEntry)
 	kv.pendingRequests = make(map[int]kvraft.RequestInfo)
 	// config migration related
-	kv.shardsToRecv = make(map[int]bool)
+	kv.shardsToRecv = make(map[int]int)
 	kv.pendingShards = make(map[ShardInfo]InstallShardArgs)
 	kv.condSendShards = sync.NewCond(&kv.muSendShards)
 	// load config

@@ -644,7 +644,9 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	kv.killCh <- true
 	kv.condSendShards.Broadcast()
+	kv.mck.Kill()
 	kv.FailAllPendingRequests(kvraft.ErrKilled)
+	raft.CheckKillFinish(10, func() bool { return kv.CheckKillComplete() }, kv)
 }
 
 func (kv *ShardKV) CheckKillComplete() bool {

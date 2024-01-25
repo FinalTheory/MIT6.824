@@ -38,7 +38,8 @@ type ShardCtrler struct {
 	configs          []Config // indexed by config num
 
 	// states related to gracefully kill
-	killCh chan bool
+	killCh         chan bool
+	executorKilled atomic.Bool
 }
 
 type Op struct {
@@ -196,6 +197,7 @@ func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
 	sc.killCh <- true
 	sc.FailAllPendingRequests(kvraft.ErrKilled)
+	raft.CheckKillFinish(10, func() bool { return sc.executorKilled.Load() }, sc)
 }
 
 func (sc *ShardCtrler) killed() bool {
@@ -204,6 +206,7 @@ func (sc *ShardCtrler) killed() bool {
 }
 
 func (sc *ShardCtrler) OperationExecutor() {
+	defer sc.executorKilled.Store(true)
 	for !sc.killed() {
 		DPrintf("[%d] waiting for op", sc.me)
 		select {

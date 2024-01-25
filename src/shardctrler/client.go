@@ -5,7 +5,6 @@ package shardctrler
 //
 
 import (
-	"6.5840/kvraft"
 	"6.5840/labrpc"
 	"sync/atomic"
 )
@@ -17,6 +16,7 @@ type Clerk struct {
 	servers    []*labrpc.ClientEnd
 	clientId   int64
 	seqCounter atomic.Int32
+	dead       atomic.Bool
 }
 
 func nrand() int64 {
@@ -31,7 +31,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	ck.clientId = nrand()
 	ck.seqCounter.Store(0)
+	ck.dead.Store(false)
 	return ck
+}
+
+func (ck *Clerk) Kill() {
+	ck.dead.Store(true)
+}
+
+func (ck *Clerk) killed() bool {
+	return ck.dead.Load()
 }
 
 func (ck *Clerk) Query(num int) Config {
@@ -47,7 +56,7 @@ func (ck *Clerk) Query(num int) Config {
 			if ok && reply.WrongLeader == false {
 				return reply.Config
 			}
-			if ok && reply.Err == kvraft.ErrKilled {
+			if ck.killed() {
 				return reply.Config
 			}
 		}
@@ -69,6 +78,9 @@ func (ck *Clerk) Join(servers map[int][]string) {
 			if ok && reply.WrongLeader == false {
 				return
 			}
+			if ck.killed() {
+				return
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -86,6 +98,9 @@ func (ck *Clerk) Leave(gids []int) {
 			var reply LeaveReply
 			ok := srv.Call("ShardCtrler.Leave", args, &reply)
 			if ok && reply.WrongLeader == false {
+				return
+			}
+			if ck.killed() {
 				return
 			}
 		}
@@ -106,6 +121,9 @@ func (ck *Clerk) Move(shard int, gid int) {
 			var reply MoveReply
 			ok := srv.Call("ShardCtrler.Move", args, &reply)
 			if ok && reply.WrongLeader == false {
+				return
+			}
+			if ck.killed() {
 				return
 			}
 		}

@@ -52,6 +52,7 @@ type InstallShardArgs struct {
 	Shard int
 	Data  map[string]string
 	Num   int
+	Dedup map[DedupKey]DedupEntry
 	// for logging purpose
 	From int
 }

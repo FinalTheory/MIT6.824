@@ -19,7 +19,6 @@ const (
 const (
 	ConfigChange = "ConfigChange"
 	InstallShard = "InstallShard"
-	SendShard    = "SendShard"
 )
 
 type Err string
@@ -53,7 +52,7 @@ type InstallShardArgs struct {
 	Shard int
 	Data  map[string]string
 	Num   int
-	Dedup map[DedupKey]DedupEntry
+	Dedup map[int64]DedupEntry
 	// for logging purpose
 	From int
 }

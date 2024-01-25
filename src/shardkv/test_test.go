@@ -773,15 +773,15 @@ func TestChallenge1Delete(t *testing.T) {
 	cfg.join(1)
 	cfg.join(2)
 	time.Sleep(1 * time.Second)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 30; i++ {
 		check(t, ck, ka[i], va[i])
 	}
 	time.Sleep(1 * time.Second)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 30; i++ {
 		check(t, ck, ka[i], va[i])
 	}
 	time.Sleep(1 * time.Second)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 30; i++ {
 		check(t, ck, ka[i], va[i])
 	}
 

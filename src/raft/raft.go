@@ -22,10 +22,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"os"
 	"runtime"
-	"runtime/pprof"
-
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -999,17 +996,7 @@ func (rf *Raft) Kill() {
 	for i := 0; i < rf.killChSize; i += 1 {
 		rf.killCh <- true
 	}
-	go func(start int64) {
-		for !rf.CheckKillComplete() {
-			time.Sleep(time.Millisecond * 100)
-			timeout := int64(10)
-			if time.Now().UnixMilli()-start > timeout*1000 {
-				log.Printf("Spent more than %ds to kill Raft %p", timeout, rf)
-				fid, _ := os.Create("goroutine.txt")
-				pprof.Lookup("goroutine").WriteTo(fid, 2)
-			}
-		}
-	}(time.Now().UnixMilli())
+	CheckKillFinish(10, func() bool { return rf.CheckKillComplete() }, rf)
 }
 
 func (rf *Raft) killed() bool {

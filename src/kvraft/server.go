@@ -333,15 +333,7 @@ func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	kv.killCh <- true
 	kv.FailAllPendingRequests(ErrKilled)
-	go func(start int64) {
-		for !kv.CheckKillComplete() {
-			time.Sleep(time.Millisecond * 100)
-			timeout := int64(10)
-			if time.Now().UnixMilli()-start > timeout*1000 {
-				log.Printf("Spent more than %ds to kill %p", timeout, kv)
-			}
-		}
-	}(time.Now().UnixMilli())
+	raft.CheckKillFinish(10, func() bool { return kv.CheckKillComplete() }, kv)
 }
 
 func (kv *KVServer) CheckKillComplete() bool {

@@ -19,6 +19,7 @@ const (
 const (
 	ConfigChange = "ConfigChange"
 	InstallShard = "InstallShard"
+	SendShard    = "SendShard"
 )
 
 type Err string

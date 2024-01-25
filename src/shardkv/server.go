@@ -49,6 +49,7 @@ type Op struct {
 	NewConfig *shardctrler.Config
 	// install shard migration data
 	ShardArgs InstallShardArgs
+	Servers   []string
 }
 
 func (op *Op) RequestId() kvraft.RequestId {
@@ -91,11 +92,10 @@ type ShardKV struct {
 	dedup  map[DedupKey]DedupEntry
 
 	// states to send shards during migration
-	config                atomic.Pointer[shardctrler.Config]
-	skippedConfigChangeOp int
-	shardsToSend          []ShardData
-	muSendShards          sync.Mutex
-	condSendShards        *sync.Cond
+	config         atomic.Pointer[shardctrler.Config]
+	shardsToSend   []ShardData
+	muSendShards   sync.Mutex
+	condSendShards *sync.Cond
 	// states to handle shard migration
 	shardsToRecv  map[int]bool
 	pendingShards map[ShardInfo]InstallShardArgs
@@ -355,7 +355,13 @@ func (kv *ShardKV) SendShards(shards []int, newConfig *shardctrler.Config) {
 	// not lock needed here to access the state
 	shardData := make(map[int]ShardData)
 	for _, shard := range shards {
-		arg := InstallShardArgs{Shard: shard, Data: make(map[string]string), From: kv.gid, Num: newConfig.Num, Dedup: make(map[DedupKey]DedupEntry)}
+		arg := InstallShardArgs{
+			Shard: shard,
+			Data:  make(map[string]string),
+			Dedup: make(map[DedupKey]DedupEntry),
+			Num:   newConfig.Num,
+			From:  kv.gid,
+		}
 		shardData[shard] = ShardData{Arg: arg, Servers: newConfig.Groups[newConfig.Shards[shard]]}
 	}
 	// copy shard values from current state
@@ -369,22 +375,24 @@ func (kv *ShardKV) SendShards(shards []int, newConfig *shardctrler.Config) {
 	}
 	// send the dedup table together with shards
 	kv.rwLock.Lock()
-	for key, value := range kv.dedup {
+	for key, entry := range kv.dedup {
 		for _, shard := range shards {
 			if key.Shard == shard {
+				shardData[shard].Arg.Dedup[key] = entry
 				delete(kv.dedup, key)
-				shardData[shard].Arg.Dedup[key] = value
 			}
 		}
 	}
 	kv.rwLock.Unlock()
-	// put requests into send queue
-	kv.muSendShards.Lock()
+	// save the send request into Raft, so we don't lose the data on restart
 	for _, data := range shardData {
-		kv.shardsToSend = append(kv.shardsToSend, data)
+		kv.rf.Start(Op{
+			Op:        SendShard,
+			From:      kv.me,
+			ShardArgs: data.Arg,
+			Servers:   data.Servers,
+		})
 	}
-	kv.condSendShards.Signal()
-	kv.muSendShards.Unlock()
 }
 
 func (kv *ShardKV) IsConfigChangeValid(op Op) bool {
@@ -393,11 +401,19 @@ func (kv *ShardKV) IsConfigChangeValid(op Op) bool {
 	return kv.config.Load().Num+1 == op.NewConfig.Num && len(kv.shardsToRecv) == 0
 }
 
+func (kv *ShardKV) HandleSendShard(op Op) {
+	data := ShardData{Arg: op.ShardArgs, Servers: op.Servers}
+	// put requests into send queue
+	kv.muSendShards.Lock()
+	kv.shardsToSend = append(kv.shardsToSend, data)
+	kv.condSendShards.Signal()
+	kv.muSendShards.Unlock()
+}
+
 func (kv *ShardKV) HandleConfigChange(op Op) {
 	// not lock needed here to access the state
 	// dedup for config change operation
 	if !kv.IsConfigChangeValid(op) {
-		kv.skippedConfigChangeOp += 1
 		return
 	}
 	activeConfig := kv.config.Load()
@@ -461,8 +477,10 @@ func (kv *ShardKV) OperationExecutor() {
 				kv.DPrintf("[%d][%d] Config Change [%d] Config: %+v", kv.gid, kv.me, cmd.CommandIndex, *op.NewConfig)
 				kv.HandleConfigChange(op)
 			case InstallShard:
-				kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d, Value: %v", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard, op.ShardArgs.Data)
+				kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard)
 				kv.HandleInstallShard(op)
+			case SendShard:
+				kv.HandleSendShard(op)
 			default:
 				kv.DPrintf("[%d][%d] Apply command [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
 				cfg := kv.config.Load()
@@ -569,6 +587,7 @@ func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
 	if err := e.Encode(kv.dedup); err != nil {
 		log.Fatal(err)
 	}
+	// config MUST be persisted, otherwise we'll serve wrong shard after restart
 	if err := e.Encode(*kv.config.Load()); err != nil {
 		log.Fatal(err)
 	}
@@ -578,11 +597,6 @@ func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
 	if err := e.Encode(kv.pendingShards); err != nil {
 		log.Fatal(err)
 	}
-	kv.muSendShards.Lock()
-	if err := e.Encode(kv.shardsToSend); err != nil {
-		log.Fatal(err)
-	}
-	kv.muSendShards.Unlock()
 	state := buf.Bytes()
 	kv.rf.Snapshot(cmd.CommandIndex, state)
 }
@@ -599,17 +613,13 @@ func (kv *ShardKV) ReloadFromSnapshot(data []byte) {
 	var cfg shardctrler.Config
 	var shardsToRecv map[int]bool
 	var pendingShards map[ShardInfo]InstallShardArgs
-	var shardsToSend []ShardData
-	if d.Decode(&lastAppliedIndex) != nil || d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&cfg) != nil || d.Decode(&shardsToRecv) != nil || d.Decode(&pendingShards) != nil || d.Decode(&shardsToSend) != nil {
+	if d.Decode(&lastAppliedIndex) != nil || d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&cfg) != nil || d.Decode(&shardsToRecv) != nil || d.Decode(&pendingShards) != nil {
 		panic("Failed to reload persisted snapshot into application.")
 	}
 	// configuration update related states
 	kv.config.Store(&cfg)
 	kv.shardsToRecv = shardsToRecv
 	kv.pendingShards = pendingShards
-	kv.muSendShards.Lock()
-	kv.shardsToSend = shardsToSend
-	kv.muSendShards.Unlock()
 	// KV server state machine related
 	kv.rwLock.Lock()
 	kv.state = state

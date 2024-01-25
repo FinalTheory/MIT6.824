@@ -292,7 +292,7 @@ func (rf *Raft) DebugLock() {
 	for !rf.mu.TryLock() {
 		owner := rf.lockOwner.Load()
 		if owner != nil {
-			log.Printf("[%p][%d] Failed to acquire lock hold by %s", rf, rf.me, *owner)
+			log.Printf("[%d][%d] Failed to acquire lock hold by %s", rf.GID, rf.me, *owner)
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

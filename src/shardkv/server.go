@@ -122,7 +122,6 @@ func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
 
 // ShouldStartCommand returns whether to accept this RPC
 func (kv *ShardKV) ShouldStartCommand(key string, clientId int64, newSeq int32, err *Err, value *string) bool {
-	shard := key2shard(key)
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		*err = ErrWrongLeader
@@ -131,7 +130,7 @@ func (kv *ShardKV) ShouldStartCommand(key string, clientId int64, newSeq int32, 
 	kv.rwLock.RLock()
 	defer kv.rwLock.RUnlock()
 	entry, ok := kv.dedup[clientId]
-	if ok && entry.Shard == shard {
+	if ok {
 		switch {
 		case newSeq == entry.SeqNumber:
 			*err = OK
@@ -178,8 +177,11 @@ func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply
 
 func (kv *ShardKV) AddShardToState(args InstallShardArgs) {
 	kv.rwLock.Lock()
-	for k, v := range args.Dedup {
-		kv.dedup[k] = v
+	for k, entry := range args.Dedup {
+		e, ok := kv.dedup[k]
+		if !ok || entry.SeqNumber > e.SeqNumber {
+			kv.dedup[k] = entry
+		}
 	}
 	kv.rwLock.Unlock()
 	for key, value := range args.Data {
@@ -348,11 +350,9 @@ func (kv *ShardKV) SendShardImpl(key ShardInfo) {
 		ok := srv.Call("ShardKV.InstallShard", &data.Arg, &reply)
 		if ok && reply.Success == true {
 			raft.TraceInstant("SendShard", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
-				"GID":           kv.gid,
-				"data":          fmt.Sprintf("%+v", data),
-				"config":        fmt.Sprintf("%+v", *kv.config.Load()),
-				"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
-				"pendingShards": fmt.Sprintf("%v", keys(kv.pendingShards)),
+				"GID":    kv.gid,
+				"data":   fmt.Sprintf("%+v", data),
+				"config": fmt.Sprintf("%+v", *kv.config.Load()),
 			})
 			kv.muSendShards.Lock()
 			delete(kv.shardsToSend, data.Arg.ShardInfo())
@@ -569,7 +569,7 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 	result := ""
 	// No lock need here because the only competing goroutine is read only
 	entry, ok := kv.dedup[op.ClientId]
-	if ok && op.SeqNumber == entry.SeqNumber && shard == entry.Shard {
+	if ok && op.SeqNumber == entry.SeqNumber {
 		return entry.Value
 	}
 	// Q: will there be op.SeqNumber < seq?
@@ -766,7 +766,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.killCh = make(chan bool, 10)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.rf.GID = kv.gid
+	atomic.StoreInt32(&kv.rf.GID, int32(kv.gid))
 	// KV server states
 	kv.state = make(map[string]string)
 	kv.dedup = make(map[int64]DedupEntry)

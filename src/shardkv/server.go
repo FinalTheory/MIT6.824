@@ -68,6 +68,11 @@ type ShardData struct {
 	Servers []string
 }
 
+type DedupKey struct {
+	ClientId int64
+	Shard    int
+}
+
 type DedupEntry struct {
 	SeqNumber int32
 	Value     string
@@ -93,7 +98,7 @@ type ShardKV struct {
 	lastAppliedIndex int
 
 	rwLock sync.RWMutex
-	dedup  map[int64]DedupEntry
+	dedup  map[DedupKey]DedupEntry
 
 	// states to send shards during migration
 	config         atomic.Pointer[shardctrler.Config]
@@ -129,7 +134,7 @@ func (kv *ShardKV) ShouldStartCommand(key string, clientId int64, newSeq int32, 
 	}
 	kv.rwLock.RLock()
 	defer kv.rwLock.RUnlock()
-	entry, ok := kv.dedup[clientId]
+	entry, ok := kv.dedup[DedupKey{ClientId: clientId, Shard: key2shard(key)}]
 	if ok {
 		switch {
 		case newSeq == entry.SeqNumber:
@@ -178,10 +183,7 @@ func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply
 func (kv *ShardKV) AddShardToState(args InstallShardArgs) {
 	kv.rwLock.Lock()
 	for k, entry := range args.Dedup {
-		e, ok := kv.dedup[k]
-		if !ok || entry.SeqNumber > e.SeqNumber {
-			kv.dedup[k] = entry
-		}
+		kv.dedup[k] = entry
 	}
 	kv.rwLock.Unlock()
 	for key, value := range args.Data {
@@ -392,7 +394,7 @@ func (kv *ShardKV) SendShards(shards []int, newConfig *shardctrler.Config) {
 		arg := InstallShardArgs{
 			Shard: shard,
 			Data:  make(map[string]string),
-			Dedup: make(map[int64]DedupEntry),
+			Dedup: make(map[DedupKey]DedupEntry),
 			Num:   newConfig.Num,
 			From:  kv.gid,
 		}
@@ -568,7 +570,7 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 	shard := key2shard(op.Key)
 	result := ""
 	// No lock need here because the only competing goroutine is read only
-	entry, ok := kv.dedup[op.ClientId]
+	entry, ok := kv.dedup[DedupKey{ClientId: op.ClientId, Shard: shard}]
 	if ok && op.SeqNumber == entry.SeqNumber {
 		return entry.Value
 	}
@@ -598,7 +600,7 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 		"state":  kv.state[op.Key],
 		"config": fmt.Sprintf("%+v", *kv.config.Load()),
 	})
-	kv.dedup[op.ClientId] = DedupEntry{Value: result, SeqNumber: op.SeqNumber, Shard: shard}
+	kv.dedup[DedupKey{ClientId: op.ClientId, Shard: shard}] = DedupEntry{Value: result, SeqNumber: op.SeqNumber, Shard: shard}
 	return result
 }
 
@@ -640,20 +642,10 @@ func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
 	kv.muSendShards.Unlock()
 	shardsToSendLen := buf.Len() - prevLen
 	state := buf.Bytes()
-	dedupSize := 0
-	dedupKeys := make([]int64, 0)
-	for k, v := range kv.dedup {
-		if len(v.Value) > 0 {
-			dedupSize += 1
-			dedupKeys = append(dedupKeys, k)
-		}
-	}
 	raft.TraceInstant("AppSnapshot", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
 		"stateLen":         stateLen,
 		"stateSize":        len(kv.state),
 		"dedupLen":         dedupLen,
-		"dedupSize":        dedupSize,
-		"dedupKeys":        fmt.Sprintf("%v", dedupKeys),
 		"pendingShardsLen": pendingShardsLen,
 		"shardsToSendLen":  shardsToSendLen,
 		"config":           fmt.Sprintf("%+v", *kv.config.Load()),
@@ -670,7 +662,7 @@ func (kv *ShardKV) ReloadFromSnapshot(data []byte) {
 	d := labgob.NewDecoder(r)
 	var lastAppliedIndex int
 	var state map[string]string
-	var dedupTable map[int64]DedupEntry
+	var dedupTable map[DedupKey]DedupEntry
 	var cfg shardctrler.Config
 	var shardsToRecv map[int]int
 	var pendingShards map[ShardInfo]InstallShardArgs
@@ -769,7 +761,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	atomic.StoreInt32(&kv.rf.GID, int32(kv.gid))
 	// KV server states
 	kv.state = make(map[string]string)
-	kv.dedup = make(map[int64]DedupEntry)
+	kv.dedup = make(map[DedupKey]DedupEntry)
 	kv.pendingRequests = make(map[int]kvraft.RequestInfo)
 	// config migration related
 	kv.shardsToRecv = make(map[int]int)

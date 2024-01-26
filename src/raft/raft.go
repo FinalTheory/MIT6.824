@@ -529,10 +529,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				return
 			}
 		} else {
-			// also return false if we don't find PrevLogIndex in own log
+			// return failure if we don't find `PrevLogIndex` in own log, which could be either log too short or this index already in snapshot
+			// in the latter case, follower might actually have longer log size than leader, and we should reply with the first index that not yet in snapshot
+			if args.PrevLogIndex >= rf.log.Length() {
+				reply.XLen = rf.log.Length()
+			} else {
+				reply.XLen = rf.log.StartFrom
+			}
 			goto failed
 		}
 	} else if rf.log.IsEmpty() && args.PrevLogIndex != -1 {
+		reply.XLen = 0
 		goto failed
 	} else if !rf.log.IsEmpty() && args.PrevLogIndex == -1 {
 		// we'll later truncate our logs
@@ -554,7 +561,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	return
 failed:
-	reply.XLen = rf.log.Length()
 	reply.XTerm = -1
 	reply.XIndex = -1
 	reply.Success = false
@@ -870,10 +876,7 @@ func (rf *Raft) FindTermInLogLocked(start int, term int) int {
 
 func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.XTerm == -1 {
-		// follower's log at `PrevLogIndex` could be either too short or already in snapshot
-		// in the latter case, follower might actually have longer log size (e.g. `reply.XLen > rf.log.Length()`)
-		// we only need to ensure `nextIndex` is decreasing on failure, and it will finally cause leader to send a snapshot instead
-		rf.nextIndex[server] = min(reply.XLen, max(rf.nextIndex[server]-1, 0))
+		rf.nextIndex[server] = reply.XLen
 	} else {
 		// check if the conflict term in follower also exists in leader
 		// and return the last log entry index of the term

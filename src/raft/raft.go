@@ -582,19 +582,26 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex < rf.log.StartFrom {
 		return
 	}
+	applySnapshot := true
 	// follower contains more log entries than snapshot
 	if args.LastIncludedIndex < rf.log.Length() && rf.log.TermAt(args.LastIncludedIndex) == args.LastIncludedTerm {
+		// if we reach out here, it means snapshot from leader contain more logs than in current snapshot, thus we should persist this snapshot
 		rf.log.SnapshotTo(args.LastIncludedIndex)
-		rf.commitIndex = max(args.LastIncludedIndex, rf.commitIndex)
-		rf.lastApplied = max(args.LastIncludedIndex, rf.lastApplied)
+		// but snapshot from leader might not contain the logs up to `commitIndex` yet, thus we do not apply the snapshot to application
+		if rf.commitIndex >= args.LastIncludedIndex {
+			applySnapshot = false
+		}
 	} else {
 		// discard entire log
 		rf.log.Reset(args.LastIncludedIndex, args.LastIncludedTerm)
-		rf.commitIndex = args.LastIncludedIndex
-		rf.lastApplied = args.LastIncludedIndex
 	}
 	rf.snapshot = args.Data
 	rf.persist()
+	if !applySnapshot {
+		return
+	}
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
 	msg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      clone(rf.snapshot),

@@ -26,13 +26,13 @@ const (
 )
 
 type Op struct {
-	Key        string
-	Value      string
-	Op         string
-	ToClientCh chan string
-	From       int
-	ClientId   int64
-	SeqNumber  int32
+	Key       string
+	Value     string
+	Op        string
+	ResultCh  chan string
+	From      int
+	ClientId  int64
+	SeqNumber int32
 }
 
 func (op *Op) RequestId() RequestId {
@@ -117,15 +117,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if !kv.ShouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
 		return
 	}
-	clientCh := make(chan string, 1)
+	resultCh := make(chan string, 1)
 	failCh := make(chan Err, 1)
 	index, _, isLeader := kv.rf.Start(Op{
-		Key:        args.Key,
-		Op:         GetOp,
-		ToClientCh: clientCh,
-		From:       kv.me,
-		ClientId:   args.ClientId,
-		SeqNumber:  args.SeqNumber,
+		Key:       args.Key,
+		Op:        GetOp,
+		ResultCh:  resultCh,
+		From:      kv.me,
+		ClientId:  args.ClientId,
+		SeqNumber: args.SeqNumber,
 	})
 	if isLeader {
 		DPrintf("[%d] Get start index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
@@ -135,7 +135,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		select {
 		case err := <-failCh:
 			reply.Err = err
-		case result := <-clientCh:
+		case result := <-resultCh:
 			reply.Value = result
 			reply.Err = OK
 		case <-time.After(time.Second * RPCTimeout):
@@ -150,16 +150,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if !kv.ShouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, nil) {
 		return
 	}
-	clientCh := make(chan string, 1)
+	resultCh := make(chan string, 1)
 	failCh := make(chan Err, 1)
 	index, _, isLeader := kv.rf.Start(Op{
-		Key:        args.Key,
-		Value:      args.Value,
-		Op:         args.Op,
-		ToClientCh: clientCh,
-		From:       kv.me,
-		ClientId:   args.ClientId,
-		SeqNumber:  args.SeqNumber,
+		Key:       args.Key,
+		Value:     args.Value,
+		Op:        args.Op,
+		ResultCh:  resultCh,
+		From:      kv.me,
+		ClientId:  args.ClientId,
+		SeqNumber: args.SeqNumber,
 	})
 	if isLeader {
 		DPrintf("[%d] PutAppend start index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
@@ -169,7 +169,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		select {
 		case err := <-failCh:
 			reply.Err = err
-		case <-clientCh:
+		case <-resultCh:
 			reply.Err = OK
 		case <-time.After(time.Second * RPCTimeout):
 			reply.Err = ErrTimeOut
@@ -189,7 +189,10 @@ func (kv *KVServer) OperationExecutor() {
 				kv.FailAllPendingRequests(ErrLostLeadership)
 				continue
 			}
-			if cmd.SnapshotValid && cmd.SnapshotIndex > kv.lastAppliedIndex {
+			if cmd.SnapshotValid && cmd.SnapshotIndex <= kv.lastAppliedIndex {
+				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, kv.lastAppliedIndex))
+			}
+			if cmd.SnapshotValid {
 				kv.ReloadFromSnapshot(cmd.Snapshot)
 				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
@@ -199,18 +202,18 @@ func (kv *KVServer) OperationExecutor() {
 			}
 			kv.FailConflictPendingRequests(cmd)
 			if cmd.CommandIndex <= kv.lastAppliedIndex {
-				continue
+				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
 			}
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", kv.me, cmd.CommandIndex, op)
 			result := kv.ApplyOperation(op)
 			kv.lastAppliedIndex = cmd.CommandIndex
 			// only notify completion when request waiting on same server and channel available
-			// we also need to ensure `ToClientCh` is not nil, because if server restarts before this entry committed
+			// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
 			// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
 			// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
-			if op.From == kv.me && op.ToClientCh != nil {
-				op.ToClientCh <- result
+			if op.From == kv.me && op.ResultCh != nil {
+				op.ResultCh <- result
 			}
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
 				kv.DoSnapshot(cmd)

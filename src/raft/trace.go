@@ -25,7 +25,7 @@ func InitNewTrace() {
 	if gFile != nil {
 		CloseTraceFileLocked()
 	}
-	fid, err := os.Create(fmt.Sprintf("trace-%d.json", gCounter))
+	fid, err := os.Create(fmt.Sprintf("%strace-%d.json", os.Getenv("TRACE_PREFIX"), gCounter))
 	gCounter += 1
 	if err != nil {
 		panic("Failed to create trace gFile")

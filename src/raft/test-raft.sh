@@ -12,7 +12,7 @@ trap 'kill -INT -$pid; exit 1' INT
 runs=$1
 
 for i in $(seq 1 $runs); do
-    rm -fr *.json*
+    rm -fr "${TRACE_PREFIX}*.json*"
     timeout -k 2s 900s go test &
     pid=$!
     if ! wait $pid; then

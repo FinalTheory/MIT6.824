@@ -729,86 +729,86 @@ func TestUnreliable3(t *testing.T) {
 
 // optional test to see whether servers are deleting
 // shards for which they are no longer responsible.
-//func TestChallenge1Delete(t *testing.T) {
-//	fmt.Printf("Test: shard deletion (challenge 1) ...\n")
-//
-//	// "1" means force snapshot after every log entry.
-//	cfg := make_config(t, 3, false, 1)
-//	defer cfg.cleanup()
-//
-//	ck := cfg.makeClient()
-//
-//	cfg.join(0)
-//
-//	// 30,000 bytes of total values.
-//	n := 30
-//	ka := make([]string, n)
-//	va := make([]string, n)
-//	for i := 0; i < n; i++ {
-//		ka[i] = strconv.Itoa(i)
-//		va[i] = randstring(1000)
-//		ck.Put(ka[i], va[i])
-//	}
-//	for i := 0; i < 3; i++ {
-//		check(t, ck, ka[i], va[i])
-//	}
-//
-//	for iters := 0; iters < 2; iters++ {
-//		cfg.join(1)
-//		cfg.leave(0)
-//		cfg.join(2)
-//		time.Sleep(3 * time.Second)
-//		for i := 0; i < 3; i++ {
-//			check(t, ck, ka[i], va[i])
-//		}
-//		cfg.leave(1)
-//		cfg.join(0)
-//		cfg.leave(2)
-//		time.Sleep(3 * time.Second)
-//		for i := 0; i < 3; i++ {
-//			check(t, ck, ka[i], va[i])
-//		}
-//	}
-//
-//	cfg.join(1)
-//	cfg.join(2)
-//	time.Sleep(1 * time.Second)
-//	for i := 0; i < 30; i++ {
-//		check(t, ck, ka[i], va[i])
-//	}
-//	time.Sleep(1 * time.Second)
-//	for i := 0; i < 30; i++ {
-//		check(t, ck, ka[i], va[i])
-//	}
-//	time.Sleep(1 * time.Second)
-//	for i := 0; i < 30; i++ {
-//		check(t, ck, ka[i], va[i])
-//	}
-//
-//	total := 0
-//	for gi := 0; gi < cfg.ngroups; gi++ {
-//		for i := 0; i < cfg.n; i++ {
-//			raft := cfg.groups[gi].saved[i].RaftStateSize()
-//			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
-//			total += raft + snap
-//		}
-//	}
-//
-//	// 27 keys should be stored once.
-//	// 3 keys should also be stored in client dup tables.
-//	// everything on 3 replicas.
-//	// plus slop.
-//	expected := 3 * (((n - 3) * 1000) + 2*3*1000 + 6000)
-//	if total > expected {
-//		t.Fatalf("snapshot + persisted Raft state are too big: %v > %v\n", total, expected)
-//	}
-//
-//	for i := 0; i < n; i++ {
-//		check(t, ck, ka[i], va[i])
-//	}
-//
-//	fmt.Printf("  ... Passed\n")
-//}
+func TestChallenge1Delete(t *testing.T) {
+	fmt.Printf("Test: shard deletion (challenge 1) ...\n")
+
+	// "1" means force snapshot after every log entry.
+	cfg := make_config(t, 3, false, 1)
+	defer cfg.cleanup()
+
+	ck := cfg.makeClient()
+
+	cfg.join(0)
+
+	// 30,000 bytes of total values.
+	n := 30
+	ka := make([]string, n)
+	va := make([]string, n)
+	for i := 0; i < n; i++ {
+		ka[i] = strconv.Itoa(i)
+		va[i] = randstring(1000)
+		ck.Put(ka[i], va[i])
+	}
+	for i := 0; i < 3; i++ {
+		check(t, ck, ka[i], va[i])
+	}
+
+	for iters := 0; iters < 2; iters++ {
+		cfg.join(1)
+		cfg.leave(0)
+		cfg.join(2)
+		time.Sleep(3 * time.Second)
+		for i := 0; i < 3; i++ {
+			check(t, ck, ka[i], va[i])
+		}
+		cfg.leave(1)
+		cfg.join(0)
+		cfg.leave(2)
+		time.Sleep(3 * time.Second)
+		for i := 0; i < 3; i++ {
+			check(t, ck, ka[i], va[i])
+		}
+	}
+
+	cfg.join(1)
+	cfg.join(2)
+	time.Sleep(1 * time.Second)
+	for i := 0; i < 3; i++ {
+		check(t, ck, ka[i], va[i])
+	}
+	time.Sleep(1 * time.Second)
+	for i := 0; i < 3; i++ {
+		check(t, ck, ka[i], va[i])
+	}
+	time.Sleep(1 * time.Second)
+	for i := 0; i < 3; i++ {
+		check(t, ck, ka[i], va[i])
+	}
+
+	total := 0
+	for gi := 0; gi < cfg.ngroups; gi++ {
+		for i := 0; i < cfg.n; i++ {
+			raft := cfg.groups[gi].saved[i].RaftStateSize()
+			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
+			total += raft + snap
+		}
+	}
+
+	// 27 keys should be stored once.
+	// 3 keys should also be stored in client dup tables.
+	// everything on 3 replicas.
+	// plus slop.
+	expected := 3 * (((n - 3) * 1000) + 2*3*1000 + 6000)
+	if total > expected {
+		t.Fatalf("snapshot + persisted Raft state are too big: %v > %v\n", total, expected)
+	}
+
+	for i := 0; i < n; i++ {
+		check(t, ck, ka[i], va[i])
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
 
 // optional test to see whether servers can handle
 // shards that are not affected by a config change

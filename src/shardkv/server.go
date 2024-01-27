@@ -459,7 +459,10 @@ func (kv *ShardKV) OperationExecutor() {
 				kv.FailAllPendingRequests(kvraft.ErrLostLeadership)
 				continue
 			}
-			if cmd.SnapshotValid && cmd.SnapshotIndex > kv.lastAppliedIndex {
+			if cmd.SnapshotValid && cmd.SnapshotIndex <= kv.lastAppliedIndex {
+				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, kv.lastAppliedIndex))
+			}
+			if cmd.SnapshotValid {
 				kv.ReloadFromSnapshot(cmd.Snapshot)
 				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
@@ -469,7 +472,7 @@ func (kv *ShardKV) OperationExecutor() {
 			}
 			kv.FailConflictPendingRequests(cmd)
 			if cmd.CommandIndex <= kv.lastAppliedIndex {
-				continue
+				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
 			}
 			op := cmd.Command.(Op)
 			switch op.Op {

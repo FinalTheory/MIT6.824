@@ -570,10 +570,12 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 		}
 	}
 	raft.TraceInstant("Apply", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
-		"GID":    kv.gid,
-		"op":     fmt.Sprintf("%+v", op),
-		"state":  kv.state[op.Key],
-		"config": fmt.Sprintf("%+v", *kv.config.Load()),
+		"GID":           kv.gid,
+		"op":            fmt.Sprintf("%+v", op),
+		"state":         kv.state[op.Key],
+		"config":        fmt.Sprintf("%+v", *kv.config.Load()),
+		"pendingShards": keys(kv.pendingShards),
+		"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
 	})
 	kv.dedup[DedupKey{ClientId: op.ClientId, Shard: shard}] = DedupEntry{Value: result, SeqNumber: op.SeqNumber, Shard: shard}
 	return result
@@ -608,19 +610,17 @@ func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
 	if err := e.Encode(kv.pendingShards); err != nil {
 		log.Fatal(err)
 	}
-	pendingShardsLen := buf.Len() - prevLen
 	prevLen = buf.Len()
-	shardsToSendLen := buf.Len() - prevLen
 	state := buf.Bytes()
 	raft.TraceInstant("AppSnapshot", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
-		"stateLen":         stateLen,
-		"stateSize":        len(kv.state),
-		"dedupLen":         dedupLen,
-		"dedupKeys":        fmt.Sprintf("%v", keys(kv.dedup)),
-		"pendingShardsLen": pendingShardsLen,
-		"shardsToSendLen":  shardsToSendLen,
-		"config":           fmt.Sprintf("%+v", *kv.config.Load()),
-		"total":            len(state),
+		"stateLen":      stateLen,
+		"stateSize":     len(kv.state),
+		"dedupLen":      dedupLen,
+		"dedupKeys":     fmt.Sprintf("%v", keys(kv.dedup)),
+		"pendingShards": keys(kv.pendingShards),
+		"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
+		"config":        fmt.Sprintf("%+v", *kv.config.Load()),
+		"total":         len(state),
 	})
 	kv.rf.Snapshot(cmd.CommandIndex, state)
 }

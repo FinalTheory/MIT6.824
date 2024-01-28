@@ -108,7 +108,9 @@ def run_test(test: str, race: bool, timing: bool):
         test_cmd = ["time"] + cmd
     f, path = tempfile.mkstemp()
     start = time.time()
-    proc = subprocess.run(test_cmd, stdout=f, stderr=f)
+    env = os.environ.copy()
+    env["TRACE_FILE"] = path + ".json"
+    proc = subprocess.run(test_cmd, stdout=f, stderr=f, env=env)
     runtime = time.time() - start
     os.close(f)
     return test, path, proc.returncode, runtime
@@ -212,8 +214,9 @@ def run_tests(
                         results[test]['time'].add(runtime)
                         task_progress.update(tasks[test], advance=1)
                         dest = (output / f"{test}_{completed}.log").as_posix()
+                        dest_json = (output / f"{test}_{completed}.json").as_posix()
                         if rc != 0:
-                            print(f"Failed test {test} - {dest}")
+                            print(f"Failed test {test} - {dest} {dest_json})")
                             task_progress.update(tasks[test], description=f"[red]{test}[/red]")
                             results[test]['failed'].add(1)
                         else:
@@ -223,6 +226,10 @@ def run_tests(
                         if rc != 0 or archive:
                             output.mkdir(exist_ok=True, parents=True)
                             shutil.copy(path, dest)
+                            try:
+                                shutil.copy(path + ".json", dest_json)
+                            except:
+                                pass
 
                         if timing:
                             line = last_line(path)
@@ -232,6 +239,10 @@ def run_tests(
                             results[test]['system_time'].add(float(system))
 
                         os.remove(path)
+                        try:
+                            os.remove(path + ".json")
+                        except:
+                            pass
 
                         completed += 1
                         total_progress.update(total_task, advance=1)

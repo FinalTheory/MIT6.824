@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Trace = false
+const Trace = true
 
 var gMutex sync.Mutex
 var gFile *os.File = nil
@@ -22,11 +22,20 @@ func InitNewTrace() {
 	gMutex.Lock()
 	defer gMutex.Unlock()
 
+	fileName := os.Getenv("TRACE_FILE")
+	if len(fileName) != 0 {
+		if gFile != nil {
+			return
+		}
+	} else {
+		fileName = fmt.Sprintf("%strace-%d.json", os.Getenv("TRACE_PREFIX"), gCounter)
+		gCounter += 1
+	}
+
 	if gFile != nil {
 		CloseTraceFileLocked()
 	}
-	fid, err := os.Create(fmt.Sprintf("%strace-%d.json", os.Getenv("TRACE_PREFIX"), gCounter))
-	gCounter += 1
+	fid, err := os.Create(fileName)
 	if err != nil {
 		panic("Failed to create trace gFile")
 	}

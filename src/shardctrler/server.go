@@ -23,6 +23,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type DedupEntry struct {
+	SeqNumber int32
+	Value     *Config
+}
+
 type ShardCtrler struct {
 	mu      sync.Mutex
 	me      int
@@ -31,8 +36,7 @@ type ShardCtrler struct {
 	dead    int32 // set by Kill()
 
 	rwLock     sync.RWMutex
-	dedupTable map[int64]int32
-	valueTable map[int64]*Config
+	dedupTable map[int64]DedupEntry
 
 	pendingRequests  map[int]kvraft.RequestInfo
 	lastAppliedIndex int
@@ -94,19 +98,19 @@ func (sc *ShardCtrler) ShouldStartCommand(clientId int64, newSeq int32, err *Err
 	}
 	sc.rwLock.RLock()
 	defer sc.rwLock.RUnlock()
-	seq, ok := sc.dedupTable[clientId]
+	entry, ok := sc.dedupTable[clientId]
 	if ok {
 		switch {
-		case newSeq == seq:
+		case newSeq == entry.SeqNumber:
 			*err = OK
 			if value != nil {
-				*value = *sc.valueTable[clientId]
+				*value = *entry.Value
 			}
 			return false
-		case newSeq < seq:
+		case newSeq < entry.SeqNumber:
 			*err = kvraft.ErrStaleRequest
 			return false
-		case newSeq > seq:
+		case newSeq > entry.SeqNumber:
 			return true
 		}
 	}
@@ -143,6 +147,7 @@ func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value 
 		select {
 		case e := <-failCh:
 			*err = Err(e)
+			*wrongLeader = true
 		case cfg := <-op.ToClientCh:
 			*err = OK
 			if value != nil {
@@ -150,6 +155,7 @@ func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value 
 			}
 		case <-time.After(time.Second * kvraft.RPCTimeout):
 			*err = kvraft.ErrTimeOut
+			*wrongLeader = true
 		}
 	} else {
 		*err = kvraft.ErrWrongLeader
@@ -222,7 +228,7 @@ func (sc *ShardCtrler) OperationExecutor() {
 			}
 			sc.FailConflictPendingRequests(cmd)
 			if cmd.CommandIndex <= sc.lastAppliedIndex {
-				continue
+				panic("unexpected")
 			}
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", sc.me, cmd.CommandIndex, op)
@@ -262,9 +268,9 @@ func (sc *ShardCtrler) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 func (sc *ShardCtrler) ApplyOperation(op Op) *Config {
 	emptyConfig := Config{}
 	result := &emptyConfig
-	seq, ok := sc.dedupTable[op.ClientId()]
-	if ok && op.SeqNumber() == seq {
-		return sc.valueTable[op.ClientId()]
+	entry, ok := sc.dedupTable[op.ClientId()]
+	if ok && op.SeqNumber() == entry.SeqNumber {
+		return entry.Value
 	}
 	sc.rwLock.Lock()
 	defer sc.rwLock.Unlock()
@@ -284,8 +290,7 @@ func (sc *ShardCtrler) ApplyOperation(op Op) *Config {
 		"op":           fmt.Sprintf("%+v", op),
 		"latestConfig": fmt.Sprintf("%+v", sc.configs[len(sc.configs)-1]),
 	})
-	sc.dedupTable[op.ClientId()] = op.SeqNumber()
-	sc.valueTable[op.ClientId()] = result
+	sc.dedupTable[op.ClientId()] = DedupEntry{Value: result, SeqNumber: op.SeqNumber()}
 	return result
 }
 
@@ -458,8 +463,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 	sc.killCh = make(chan bool, 10)
 	sc.lastAppliedIndex = 0
-	sc.dedupTable = make(map[int64]int32)
-	sc.valueTable = make(map[int64]*Config)
+	sc.dedupTable = make(map[int64]DedupEntry)
 	sc.pendingRequests = make(map[int]kvraft.RequestInfo)
 	go sc.OperationExecutor()
 	return sc

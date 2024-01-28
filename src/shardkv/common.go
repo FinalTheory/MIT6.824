@@ -19,6 +19,7 @@ const (
 const (
 	ConfigChange = "ConfigChange"
 	InstallShard = "InstallShard"
+	Nop          = "Nop"
 )
 
 type Err string
@@ -54,7 +55,9 @@ type InstallShardArgs struct {
 	Num   int
 	Dedup map[DedupKey]DedupEntry
 	// for logging purpose
-	From int
+	From      int
+	ClientId  int64
+	SeqNumber int32
 }
 
 type InstallShardReply struct {

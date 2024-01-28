@@ -5,6 +5,7 @@ import (
 	"6.5840/raft"
 	"fmt"
 	"log"
+	"reflect"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -382,10 +383,13 @@ func (sc *ShardCtrler) JoinImpl(args *JoinArgs) {
 	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
 	cfg.Num += 1
 	for gid, servers := range args.Servers {
-		_, ok := cfg.Groups[gid]
+		currentServers, ok := cfg.Groups[gid]
 		if ok {
-			// TODO: need error handling here if it happens
-			panic(fmt.Sprintf("[%d] Redundant GID %d", sc.me, gid))
+			slices.Sort(currentServers)
+			slices.Sort(servers)
+			if !reflect.DeepEqual(currentServers, servers) {
+				panic(fmt.Sprintf("[%d] Redundant GID %d, current servers: %v, new servers: %v", sc.me, gid, currentServers, servers))
+			}
 		}
 		cfg.Groups[gid] = servers
 	}

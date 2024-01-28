@@ -403,7 +403,7 @@ func (sc *ShardCtrler) LeaveImpl(args *LeaveArgs) {
 	for _, gid := range args.GIDs {
 		delete(cfg.Groups, gid)
 	}
-	validGID := -1
+	validGID := 0
 	for i := 0; i < NShards; i++ {
 		if _, ok := cfg.Groups[cfg.Shards[i]]; ok {
 			validGID = cfg.Shards[i]

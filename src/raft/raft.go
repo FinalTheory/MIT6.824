@@ -271,8 +271,8 @@ type Raft struct {
 	snapshot []byte
 
 	serverStartTime int64
-	lastReceivedRPC int64
-	electionTimeout int64
+	nextTimeout     int64
+	sleepTo         int64
 
 	msgQueue []ApplyMsg
 
@@ -465,7 +465,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if MoreOrEqualUpToDateThan(candidateLastLogInfo, rf.GetLastLogInfoLocked()) {
 				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
-				rf.lastReceivedRPC = time.Now().UnixMilli()
+				rf.ResetElectionTimeout()
 				TraceInstant("Vote", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 					"voteFor":              args.CandidateId,
 					"selfLastLogInfo":      fmt.Sprintf("%v", rf.GetLastLogInfoLocked()),
@@ -501,7 +501,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// only update timestamp when receiving RPC from current leader
 	if args.Term == rf.currentTerm {
-		rf.lastReceivedRPC = time.Now().UnixMilli()
+		rf.ResetElectionTimeout()
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -579,7 +579,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		"snapshotSize":           len(args.Data),
 	}))
 	if args.Term == rf.currentTerm {
-		rf.lastReceivedRPC = time.Now().UnixMilli()
+		rf.ResetElectionTimeout()
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -1018,33 +1018,35 @@ func (rf *Raft) getGID() int {
 	return int(atomic.LoadInt32(&rf.GID))
 }
 
+func (rf *Raft) ResetElectionTimeout() {
+	// pause for a random amount of time between 200 and 400
+	// milliseconds.
+	timeout := 200 + (rand.Int63() % 200)
+	atomic.StoreInt64(&rf.nextTimeout, time.Now().UnixMilli()+timeout)
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		// pause for a random amount of time between 200 and 300
-		// milliseconds.
-		rf.electionTimeout = 200 + (rand.Int63() % 200)
-		time.Sleep(time.Duration(rf.electionTimeout) * time.Millisecond)
+		// only used for once
 		if rf.serverStartTime != 0 {
 			TraceEventBegin(true, "Follower", rf.me, rf.getGID(), rf.serverStartTime, nil)
 			rf.serverStartTime = 0
 		}
-		// Check if a leader election should be started.
-		// this holds true on start
-		rf.TryStartNewElection()
+		time.Sleep(time.Millisecond * 10)
+		if time.Now().UnixMilli() > atomic.LoadInt64(&rf.nextTimeout) {
+			rf.ResetElectionTimeout()
+			rf.StartNewElection()
+		}
 	}
 	rf.tickerKilled.Store(true)
 }
 
-func (rf *Raft) TryStartNewElection() {
+func (rf *Raft) StartNewElection() {
 	if rf.killed() {
 		return
 	}
 	rf.Lock()
 	defer rf.Unlock()
-	if time.Now().UnixMilli()-rf.lastReceivedRPC <= rf.electionTimeout {
-		return
-	}
-	rf.lastReceivedRPC = time.Now().UnixMilli()
 	// do nothing if already leader
 	if rf.role == Leader {
 		return
@@ -1145,7 +1147,10 @@ func (rf *Raft) SwitchToLeader() {
 
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
-		time.Sleep(100 * time.Millisecond)
+		for time.Now().UnixMilli() < rf.sleepTo {
+			time.Sleep(time.Millisecond * 10)
+		}
+		rf.sleepTo = time.Now().UnixMilli() + 100
 		if _, isLeader := rf.GetState(); isLeader {
 			rf.heartbeatImpl()
 		}
@@ -1209,9 +1214,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = LogContainer{Data: make([]LogEntry, 0, 512), StartFrom: 0, LastIncludedTerm: -1, LastIncludedIndex: -1}
 	rf.snapshot = nil
 
-	// Your initialization code here (2A, 2B, 2C).
-	rf.electionTimeout = 0
-	rf.lastReceivedRPC = 0
+	rf.ResetElectionTimeout()
 	rf.role = Follower
 	rf.voteCount = 0
 	rf.votedFor = Null

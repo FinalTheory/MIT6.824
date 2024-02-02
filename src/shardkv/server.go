@@ -380,21 +380,25 @@ func (kv *ShardKV) SendShardImpl(key ShardInfo) {
 		ok := srv.Call("ShardKV.InstallShard", &data.Arg, &reply)
 		if ok && reply.Success == true {
 			raft.TraceInstant("SendShard", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
-				"GID":    kv.gid,
-				"data":   fmt.Sprintf("%+v", data),
-				"config": fmt.Sprintf("%+v", *kv.config.Load()),
+				"GID":     kv.gid,
+				"dataLen": fmt.Sprintf("%+v", length(data)),
+				"config":  fmt.Sprintf("%+v", *kv.config.Load()),
 			})
 			kv.muSendShards.Lock()
 			delete(kv.shardsToSend, data.Arg.ShardInfo())
-			// this is only to pass challenge 1 shard deletion
-			// when all shards are sent, we'll need 1 more log entry to trigger snapshot to reduce size
+			sendNop := false
 			if len(kv.shardsToSend) == 0 {
-				kv.rf.Start(Op{
-					Op:   Nop,
-					From: kv.me,
-				})
+				sendNop = true
 			}
 			kv.muSendShards.Unlock()
+			// this is only to pass challenge 1 shard deletion
+			// when all shards are sent, we'll need to trigger a snapshot to reduce its size
+			if sendNop {
+				kv.applyCh <- raft.ApplyMsg{CommandValid: true, CommandIndex: -1, Command: Op{
+					Op:   Nop,
+					From: kv.me,
+				}}
+			}
 			return
 		}
 	}
@@ -515,7 +519,7 @@ func (kv *ShardKV) HandleConfigChange(op Op) {
 	kv.config.Store(op.NewConfig)
 }
 
-func (kv *ShardKV) OperationExecutor() {
+func (kv *ShardKV) CommandExecutor() {
 	for !kv.killed() {
 		select {
 		// receives committed raft log entry
@@ -536,7 +540,7 @@ func (kv *ShardKV) OperationExecutor() {
 				continue
 			}
 			kv.FailConflictPendingRequests(cmd)
-			if cmd.CommandIndex <= kv.lastAppliedIndex {
+			if cmd.CommandIndex != -1 && cmd.CommandIndex <= kv.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
 			}
 			op := cmd.Command.(Op)
@@ -577,10 +581,16 @@ func (kv *ShardKV) OperationExecutor() {
 				}
 			}
 			// we can only update the last applied index after we successfully apply the operation
-			kv.lastAppliedIndex = cmd.CommandIndex
+			if cmd.CommandIndex != -1 {
+				kv.lastAppliedIndex = cmd.CommandIndex
+			}
 			// and then we can persist the states
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
-				kv.DoSnapshot(cmd)
+				if cmd.CommandIndex != -1 {
+					kv.DoSnapshot(cmd.CommandIndex)
+				} else {
+					kv.DoSnapshot(kv.lastAppliedIndex)
+				}
 			}
 		case killed := <-kv.killCh:
 			if killed {
@@ -651,7 +661,7 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 	return result
 }
 
-func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
+func (kv *ShardKV) DoSnapshot(index int) {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
 
@@ -699,7 +709,7 @@ func (kv *ShardKV) DoSnapshot(cmd raft.ApplyMsg) {
 		"config":          fmt.Sprintf("%+v", *kv.config.Load()),
 		"total":           len(state),
 	})
-	kv.rf.Snapshot(cmd.CommandIndex, state)
+	kv.rf.Snapshot(index, state)
 }
 
 func (kv *ShardKV) ReloadFromSnapshot(data []byte) {
@@ -824,7 +834,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.clientId = nrand()
 	kv.seqCounter.Store(0)
 	go kv.DaemonSendShard()
-	go kv.OperationExecutor()
+	go kv.CommandExecutor()
 	go kv.DaemonConfigFetcher()
 	return kv
 }

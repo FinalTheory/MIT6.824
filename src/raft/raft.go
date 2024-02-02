@@ -218,8 +218,10 @@ func (c *LogContainer) IsEmpty() bool {
 
 func (c *LogContainer) SnapshotTo(index int) {
 	// notice this index is internal and starts from 0
-	c.LastIncludedIndex = index
-	c.LastIncludedTerm = c.Get(index).Term
+	if index != c.LastIncludedIndex {
+		c.LastIncludedIndex = index
+		c.LastIncludedTerm = c.Get(index).Term
+	}
 	// snapshot has all entry include `index` applied, we can safely truncate them
 	c.TruncateFrom(index + 1)
 }
@@ -375,7 +377,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	func(idx int, s []byte) {
 		rf.Lock()
 		defer rf.Unlock()
-		if idx < rf.log.StartFrom {
+		// here we allow a snapshot with `index == rf.log.StartFrom-1`
+		// so as to "override" the current snapshot with same last included index
+		// this is only to pass lab 4 deletion challenge
+		if idx < rf.log.StartFrom-1 {
 			return
 		}
 		TraceInstant("Snapshot", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{

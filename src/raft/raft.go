@@ -500,7 +500,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			"args.LeaderId":     args.LeaderId,
 			"args.LeaderCommit": args.LeaderCommit,
 			"args.Entries":      fmt.Sprintf("%v", args.Entries),
-			"success":           reply.Success,
+			"reply.Term":        reply.Term,
+			"reply.Success":     reply.Success,
+			"reply.XLen":        reply.XLen,
+			"reply.XIndex":      reply.XIndex,
+			"reply.XTerm":       reply.XTerm,
 		}))
 	}()
 
@@ -842,8 +846,9 @@ func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entrie
 		termOutDated := args.Term < reply.Term
 		// we only decrement nextIndex if AppendEntries fails because of log inconsistency
 		// replicate should finally succeed when nextIndex == 0, unless currentTerm is out-dated
+		// or trigger to send a snapshot
 		if !termOutDated {
-			rf.HandleNextIndexBacktrackLocked(server, &args, &reply)
+			rf.nextIndex[server] = rf.getNextIndexBacktrackLocked(&args, &reply)
 		}
 		return false
 	}
@@ -879,16 +884,16 @@ func (rf *Raft) FindTermInLogLocked(start int, term int) int {
 	return -1
 }
 
-func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) getNextIndexBacktrackLocked(args *AppendEntriesArgs, reply *AppendEntriesReply) int {
 	if reply.XTerm == -1 {
-		rf.nextIndex[server] = reply.XLen
+		return reply.XLen
 	} else {
 		// check if the conflict term in follower also exists in leader
 		// and return the last log entry index of the term
 		idx := rf.FindTermInLogLocked(args.PrevLogIndex, reply.XTerm)
 		if idx == -1 {
 			// mismatched term (from follower) not in leader log, we're safe to skip the entire mismatch term in follower log
-			rf.nextIndex[server] = reply.XIndex
+			return reply.XIndex
 		} else {
 			// if found, we know at least to some index before PrevLogIndex in the term, the follower has matching logs with leader
 			// if we skip this entire term in leader's log, we're skipping too much
@@ -899,7 +904,7 @@ func (rf *Raft) HandleNextIndexBacktrackLocked(server int, args *AppendEntriesAr
 			// if leader send the last entry with term `2` to follower, it will fail because previous log term mismatch (2 != 1)
 			// but it will be step back too much if we skip the term 1 entirely and send from last term `0` entry
 			// thus we retry with the last entry of term `1` in leader log, and we can expect it's likely succeed
-			rf.nextIndex[server] = idx
+			return idx
 			// Notice: above could also be `nextIndex[server] = idx + 1`, based on description from https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
 			// > If it finds an entry in its log with that term, it should set nextIndex to be the one **beyond** the index of the last entry in that term in its log.
 			// Either way is safe, since it guarantees:
@@ -1026,7 +1031,7 @@ func (rf *Raft) getGID() int {
 func (rf *Raft) ResetElectionTimeout() {
 	// pause for a random amount of time between 200 and 400
 	// milliseconds.
-	timeout := 200 + (rand.Int63() % 200)
+	timeout := 400 + (rand.Int63() % 400)
 	atomic.StoreInt64(&rf.nextTimeout, time.Now().UnixMilli()+timeout)
 }
 
@@ -1093,6 +1098,13 @@ func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
 	rf.HandleTermUpdateLocked(reply.Term)
 	if !ignoreResponse && reply.VoteGranted {
 		rf.HandleVoteGrantedLocked()
+		TraceInstant("GetVote", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
+			"voteFrom":         server,
+			"currentVoteCount": rf.voteCount,
+			"arg.Term":         arg.Term,
+			"reply.Term":       reply.Term,
+			"ignoreResponse":   ignoreResponse,
+		}))
 	}
 }
 

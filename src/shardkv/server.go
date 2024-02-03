@@ -76,7 +76,6 @@ type DedupKey struct {
 type DedupEntry struct {
 	SeqNumber int32
 	Value     string
-	Shard     int
 }
 
 type ShardKV struct {
@@ -657,7 +656,7 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 		"pendingShards": keys(kv.pendingShards),
 		"shardsToRecv":  fmt.Sprintf("%v", kv.shardsToRecv),
 	})
-	kv.dedup[DedupKey{ClientId: op.ClientId, Shard: shard}] = DedupEntry{Value: result, SeqNumber: op.SeqNumber, Shard: shard}
+	kv.dedup[DedupKey{ClientId: op.ClientId, Shard: shard}] = DedupEntry{Value: result, SeqNumber: op.SeqNumber}
 	return result
 }
 

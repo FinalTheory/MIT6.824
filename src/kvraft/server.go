@@ -74,8 +74,8 @@ type KVServer struct {
 	lastAppliedIndex int
 }
 
-// ShouldStartCommand returns whether to accept this RPC
-func (kv *KVServer) ShouldStartCommand(clientId int64, newSeq int32, err *Err, value *string) bool {
+// shouldStartCommand returns whether to accept this RPC
+func (kv *KVServer) shouldStartCommand(clientId int64, newSeq int32, err *Err, value *string) bool {
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		*err = ErrWrongLeader
@@ -103,7 +103,7 @@ func (kv *KVServer) ShouldStartCommand(clientId int64, newSeq int32, err *Err, v
 	return true
 }
 
-func (kv *KVServer) RecordRequestAtIndex(index int, id RequestId, failCh chan Err) {
+func (kv *KVServer) recordRequestAtIndex(index int, id RequestId, failCh chan Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
@@ -114,7 +114,7 @@ func (kv *KVServer) RecordRequestAtIndex(index int, id RequestId, failCh chan Er
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	if !kv.ShouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
+	if !kv.shouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
 		return
 	}
 	resultCh := make(chan string, 1)
@@ -130,7 +130,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if isLeader {
 		DPrintf("[%d] Get start index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
 		defer DPrintf("[%d] Get end index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
-		kv.RecordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		kv.recordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		// block until it's committed
 		select {
 		case err := <-failCh:
@@ -147,7 +147,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	if !kv.ShouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, nil) {
+	if !kv.shouldStartCommand(args.ClientId, args.SeqNumber, &reply.Err, nil) {
 		return
 	}
 	resultCh := make(chan string, 1)
@@ -164,7 +164,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if isLeader {
 		DPrintf("[%d] PutAppend start index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
 		defer DPrintf("[%d] PutAppend end index=%d ClientId:%d SeqNumber:%d", kv.me, index, args.ClientId, args.SeqNumber)
-		kv.RecordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		kv.recordRequestAtIndex(index, RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		// block until it's committed
 		select {
 		case err := <-failCh:
@@ -179,34 +179,34 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
-func (kv *KVServer) OperationExecutor() {
+func (kv *KVServer) stateMachineExecutor() {
 	for !kv.killed() {
 		DPrintf("[%d] waiting for op", kv.me)
 		select {
 		// receives committed raft log entry
 		case cmd := <-kv.applyCh:
 			if cmd.TermChanged {
-				kv.FailAllPendingRequests(ErrLostLeadership)
+				kv.failAllPendingRequests(ErrLostLeadership)
 				continue
 			}
 			if cmd.SnapshotValid && cmd.SnapshotIndex <= kv.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, kv.lastAppliedIndex))
 			}
 			if cmd.SnapshotValid {
-				kv.ReloadFromSnapshot(cmd.Snapshot)
+				kv.reloadFromSnapshot(cmd.Snapshot)
 				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
 			}
 			if !cmd.CommandValid {
 				continue
 			}
-			kv.FailConflictPendingRequests(cmd)
+			kv.failConflictPendingRequests(cmd)
 			if cmd.CommandIndex <= kv.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
 			}
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", kv.me, cmd.CommandIndex, op)
-			result := kv.ApplyOperation(op)
+			result := kv.executeOperation(op)
 			kv.lastAppliedIndex = cmd.CommandIndex
 			// only notify completion when request waiting on same server and channel available
 			// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
@@ -216,7 +216,7 @@ func (kv *KVServer) OperationExecutor() {
 				op.ResultCh <- result
 			}
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
-				kv.DoSnapshot(cmd)
+				kv.doSnapshot(cmd)
 			}
 		case killed := <-kv.killCh:
 			if killed {
@@ -227,7 +227,7 @@ func (kv *KVServer) OperationExecutor() {
 	kv.executorKilled.Store(true)
 }
 
-func (kv *KVServer) FailAllPendingRequests(err Err) {
+func (kv *KVServer) failAllPendingRequests(err Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for k, v := range kv.pendingRequests {
@@ -236,7 +236,7 @@ func (kv *KVServer) FailAllPendingRequests(err Err) {
 	}
 }
 
-func (kv *KVServer) FailConflictPendingRequests(cmd raft.ApplyMsg) {
+func (kv *KVServer) failConflictPendingRequests(cmd raft.ApplyMsg) {
 	op := cmd.Command.(Op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -247,7 +247,7 @@ func (kv *KVServer) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 	delete(kv.pendingRequests, cmd.CommandIndex)
 }
 
-func (kv *KVServer) ApplyOperation(op Op) string {
+func (kv *KVServer) executeOperation(op Op) string {
 	result := ""
 	// No lock need here because the only competing goroutine is read only
 	seq, ok := kv.dedupTable[op.ClientId]
@@ -283,7 +283,7 @@ func (kv *KVServer) ApplyOperation(op Op) string {
 	return result
 }
 
-func (kv *KVServer) DoSnapshot(cmd raft.ApplyMsg) {
+func (kv *KVServer) doSnapshot(cmd raft.ApplyMsg) {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
 	if err := e.Encode(kv.lastAppliedIndex); err != nil {
@@ -302,7 +302,7 @@ func (kv *KVServer) DoSnapshot(cmd raft.ApplyMsg) {
 	kv.rf.Snapshot(cmd.CommandIndex, state)
 }
 
-func (kv *KVServer) ReloadFromSnapshot(data []byte) {
+func (kv *KVServer) reloadFromSnapshot(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -335,11 +335,11 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	kv.killCh <- true
-	kv.FailAllPendingRequests(ErrKilled)
-	raft.CheckKillFinish(10, func() bool { return kv.CheckKillComplete() }, kv)
+	kv.failAllPendingRequests(ErrKilled)
+	raft.CheckKillFinish(10, func() bool { return kv.checkKillComplete() }, kv)
 }
 
-func (kv *KVServer) CheckKillComplete() bool {
+func (kv *KVServer) checkKillComplete() bool {
 	return kv.executorKilled.Load()
 }
 
@@ -379,8 +379,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.valueTable = make(map[int64]string)
 	kv.pendingRequests = make(map[int]RequestInfo)
 	kv.executorKilled.Store(false)
-	kv.ReloadFromSnapshot(persister.ReadSnapshot())
-	go kv.OperationExecutor()
+	kv.reloadFromSnapshot(persister.ReadSnapshot())
+	go kv.stateMachineExecutor()
 
 	return kv
 }

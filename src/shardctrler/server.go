@@ -89,8 +89,8 @@ func (op *Op) RequestId() kvraft.RequestId {
 	return kvraft.RequestId{ClientId: op.ClientId(), SeqNumber: op.SeqNumber()}
 }
 
-// ShouldStartCommand returns whether to accept this RPC
-func (sc *ShardCtrler) ShouldStartCommand(clientId int64, newSeq int32, err *Err, wrongLeader *bool, value *Config) bool {
+// shouldStartCommand returns whether to accept this RPC
+func (sc *ShardCtrler) shouldStartCommand(clientId int64, newSeq int32, err *Err, wrongLeader *bool, value *Config) bool {
 	_, isLeader := sc.rf.GetState()
 	if !isLeader {
 		*wrongLeader = true
@@ -118,7 +118,7 @@ func (sc *ShardCtrler) ShouldStartCommand(clientId int64, newSeq int32, err *Err
 	return true
 }
 
-func (sc *ShardCtrler) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh chan kvraft.Err) {
+func (sc *ShardCtrler) recordRequestAtIndex(index int, id kvraft.RequestId, failCh chan kvraft.Err) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
@@ -128,9 +128,9 @@ func (sc *ShardCtrler) RecordRequestAtIndex(index int, id kvraft.RequestId, fail
 	sc.pendingRequests[index] = kvraft.RequestInfo{RequestId: id, FailCh: failCh}
 }
 
-func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value *Config) {
+func (sc *ShardCtrler) requestHandler(op Op, err *Err, wrongLeader *bool, value *Config) {
 	requestId := op.RequestId()
-	if !sc.ShouldStartCommand(requestId.ClientId, requestId.SeqNumber, err, wrongLeader, value) {
+	if !sc.shouldStartCommand(requestId.ClientId, requestId.SeqNumber, err, wrongLeader, value) {
 		return
 	}
 	failCh := make(chan kvraft.Err, 1)
@@ -139,9 +139,9 @@ func (sc *ShardCtrler) RequestHandler(op Op, err *Err, wrongLeader *bool, value 
 
 	index, _, isLeader := sc.rf.Start(op)
 	if isLeader {
-		DPrintf("[%s][%d] RequestHandler start index=%d ClientId:%d SeqNumber:%d", op.Type, sc.me, index, requestId.ClientId, requestId.SeqNumber)
-		defer DPrintf("[%s][%d] RequestHandler end index=%d ClientId:%d SeqNumber:%d", op.Type, sc.me, index, requestId.ClientId, requestId.SeqNumber)
-		sc.RecordRequestAtIndex(index, kvraft.RequestId{ClientId: requestId.ClientId, SeqNumber: requestId.SeqNumber}, failCh)
+		DPrintf("[%s][%d] requestHandler start index=%d ClientId:%d SeqNumber:%d", op.Type, sc.me, index, requestId.ClientId, requestId.SeqNumber)
+		defer DPrintf("[%s][%d] requestHandler end index=%d ClientId:%d SeqNumber:%d", op.Type, sc.me, index, requestId.ClientId, requestId.SeqNumber)
+		sc.recordRequestAtIndex(index, kvraft.RequestId{ClientId: requestId.ClientId, SeqNumber: requestId.SeqNumber}, failCh)
 		*wrongLeader = false
 		// block until it's committed
 		select {
@@ -168,7 +168,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		Type: JoinOp,
 		Join: *args,
 	}
-	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, nil)
+	sc.requestHandler(op, &reply.Err, &reply.WrongLeader, nil)
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -176,7 +176,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		Type:  LeaveOp,
 		Leave: *args,
 	}
-	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, nil)
+	sc.requestHandler(op, &reply.Err, &reply.WrongLeader, nil)
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
@@ -184,7 +184,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		Type: MoveOp,
 		Move: *args,
 	}
-	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, nil)
+	sc.requestHandler(op, &reply.Err, &reply.WrongLeader, nil)
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
@@ -192,7 +192,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		Type:  QueryOp,
 		Query: *args,
 	}
-	sc.RequestHandler(op, &reply.Err, &reply.WrongLeader, &reply.Config)
+	sc.requestHandler(op, &reply.Err, &reply.WrongLeader, &reply.Config)
 }
 
 // the tester calls Kill() when a ShardCtrler instance won't
@@ -203,7 +203,7 @@ func (sc *ShardCtrler) Kill() {
 	atomic.StoreInt32(&sc.dead, 1)
 	sc.rf.Kill()
 	sc.killCh <- true
-	sc.FailAllPendingRequests(kvraft.ErrKilled)
+	sc.failAllPendingRequests(kvraft.ErrKilled)
 	raft.CheckKillFinish(10, func() bool { return sc.executorKilled.Load() }, sc)
 }
 
@@ -212,7 +212,7 @@ func (sc *ShardCtrler) killed() bool {
 	return z == 1
 }
 
-func (sc *ShardCtrler) OperationExecutor() {
+func (sc *ShardCtrler) stateMachineExecutor() {
 	defer sc.executorKilled.Store(true)
 	for !sc.killed() {
 		DPrintf("[%d] waiting for op", sc.me)
@@ -220,19 +220,19 @@ func (sc *ShardCtrler) OperationExecutor() {
 		// receives committed raft log entry
 		case cmd := <-sc.applyCh:
 			if cmd.TermChanged {
-				sc.FailAllPendingRequests(kvraft.ErrLostLeadership)
+				sc.failAllPendingRequests(kvraft.ErrLostLeadership)
 				continue
 			}
 			if !cmd.CommandValid {
 				continue
 			}
-			sc.FailConflictPendingRequests(cmd)
+			sc.failConflictPendingRequests(cmd)
 			if cmd.CommandIndex <= sc.lastAppliedIndex {
 				panic("unexpected")
 			}
 			op := cmd.Command.(Op)
 			DPrintf("[%d] Apply command [%d] [%+v]", sc.me, cmd.CommandIndex, op)
-			result := sc.ApplyOperation(op)
+			result := sc.applyOperation(op)
 			sc.lastAppliedIndex = cmd.CommandIndex
 			if op.From == sc.me && op.ToClientCh != nil {
 				op.ToClientCh <- result
@@ -245,7 +245,7 @@ func (sc *ShardCtrler) OperationExecutor() {
 	}
 }
 
-func (sc *ShardCtrler) FailAllPendingRequests(err kvraft.Err) {
+func (sc *ShardCtrler) failAllPendingRequests(err kvraft.Err) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	for k, v := range sc.pendingRequests {
@@ -254,7 +254,7 @@ func (sc *ShardCtrler) FailAllPendingRequests(err kvraft.Err) {
 	}
 }
 
-func (sc *ShardCtrler) FailConflictPendingRequests(cmd raft.ApplyMsg) {
+func (sc *ShardCtrler) failConflictPendingRequests(cmd raft.ApplyMsg) {
 	op := cmd.Command.(Op)
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -265,7 +265,7 @@ func (sc *ShardCtrler) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 	delete(sc.pendingRequests, cmd.CommandIndex)
 }
 
-func (sc *ShardCtrler) ApplyOperation(op Op) *Config {
+func (sc *ShardCtrler) applyOperation(op Op) *Config {
 	emptyConfig := Config{}
 	result := &emptyConfig
 	entry, ok := sc.dedupTable[op.ClientId()]
@@ -276,13 +276,13 @@ func (sc *ShardCtrler) ApplyOperation(op Op) *Config {
 	defer sc.rwLock.Unlock()
 	switch op.Type {
 	case JoinOp:
-		sc.JoinImpl(&op.Join)
+		sc.joinImpl(&op.Join)
 	case LeaveOp:
-		sc.LeaveImpl(&op.Leave)
+		sc.leaveImpl(&op.Leave)
 	case MoveOp:
-		sc.MoveImpl(&op.Move)
+		sc.moveImpl(&op.Move)
 	case QueryOp:
-		result = sc.QueryImpl(&op.Query)
+		result = sc.queryImpl(&op.Query)
 	default:
 		panic("Invalid op type")
 	}
@@ -384,7 +384,7 @@ func ReBalance(cfg *Config) {
 	DPrintf("After Rebalance: %+v %v", *cfg, gidToShards)
 }
 
-func (sc *ShardCtrler) JoinImpl(args *JoinArgs) {
+func (sc *ShardCtrler) joinImpl(args *JoinArgs) {
 	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
 	cfg.Num += 1
 	for gid, servers := range args.Servers {
@@ -402,7 +402,7 @@ func (sc *ShardCtrler) JoinImpl(args *JoinArgs) {
 	sc.configs = append(sc.configs, *cfg)
 }
 
-func (sc *ShardCtrler) LeaveImpl(args *LeaveArgs) {
+func (sc *ShardCtrler) leaveImpl(args *LeaveArgs) {
 	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
 	cfg.Num += 1
 	for _, gid := range args.GIDs {
@@ -424,7 +424,7 @@ func (sc *ShardCtrler) LeaveImpl(args *LeaveArgs) {
 	sc.configs = append(sc.configs, *cfg)
 }
 
-func (sc *ShardCtrler) MoveImpl(args *MoveArgs) {
+func (sc *ShardCtrler) moveImpl(args *MoveArgs) {
 	cfg := copyConfig(&sc.configs[len(sc.configs)-1])
 	cfg.Num += 1
 	cfg.Shards[args.Shard] = args.GID
@@ -432,7 +432,7 @@ func (sc *ShardCtrler) MoveImpl(args *MoveArgs) {
 	sc.configs = append(sc.configs, *cfg)
 }
 
-func (sc *ShardCtrler) QueryImpl(args *QueryArgs) *Config {
+func (sc *ShardCtrler) queryImpl(args *QueryArgs) *Config {
 	i := args.Num
 	if args.Num < 0 || args.Num >= len(sc.configs) {
 		i = len(sc.configs) - 1
@@ -465,6 +465,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.lastAppliedIndex = 0
 	sc.dedupTable = make(map[int64]DedupEntry)
 	sc.pendingRequests = make(map[int]kvraft.RequestInfo)
-	go sc.OperationExecutor()
+	go sc.stateMachineExecutor()
 	return sc
 }

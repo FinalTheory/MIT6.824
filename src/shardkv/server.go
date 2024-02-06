@@ -128,8 +128,8 @@ func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-// ShouldStartCommand returns whether to accept this RPC
-func (kv *ShardKV) ShouldStartCommand(key string, clientId int64, newSeq int32, err *Err, value *string) bool {
+// shouldStartCommand returns whether to accept this RPC
+func (kv *ShardKV) shouldStartCommand(key string, clientId int64, newSeq int32, err *Err, value *string) bool {
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		*err = ErrWrongLeader
@@ -157,7 +157,7 @@ func (kv *ShardKV) ShouldStartCommand(key string, clientId int64, newSeq int32, 
 	return true
 }
 
-func (kv *ShardKV) RecordRequestAtIndex(index int, id kvraft.RequestId, failCh chan kvraft.Err) {
+func (kv *ShardKV) recordRequestAtIndex(index int, id kvraft.RequestId, failCh chan kvraft.Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	// there could be multiple requests from different clients accepted by current leader, and indices recorded into `pendingRequests`
@@ -192,7 +192,7 @@ func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply
 		// this is to ensure if a different entry is committed on `index`
 		// we should still fail the blocking request and force client to retry
 		// we don't have to care about duplication
-		kv.RecordRequestAtIndex(index, kvraft.RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		kv.recordRequestAtIndex(index, kvraft.RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		select {
 		case <-resultCh:
 			reply.Success = true
@@ -206,7 +206,7 @@ func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply
 	}
 }
 
-func (kv *ShardKV) AddShardToState(args InstallShardArgs) {
+func (kv *ShardKV) addShardToState(args InstallShardArgs) {
 	kv.rwLock.Lock()
 	for k, entry := range args.Dedup {
 		kv.dedup[k] = entry
@@ -217,7 +217,7 @@ func (kv *ShardKV) AddShardToState(args InstallShardArgs) {
 	}
 }
 
-func (kv *ShardKV) HandleInstallShard(op Op) {
+func (kv *ShardKV) handleInstallShard(op Op) {
 	// each time we receive a shard from other replica group, we're in:
 	// 1. waiting for this shard data before able to serve it
 	// 2. already got this shard and serving it, then we should ignore any duplication (duplication can happen when leader crash after log commit but before return to client)
@@ -245,7 +245,7 @@ func (kv *ShardKV) HandleInstallShard(op Op) {
 				if from != op.ShardArgs.From {
 					panic(fmt.Sprintf("Expected shard from %d, actual from %d", from, op.ShardArgs.From))
 				}
-				kv.AddShardToState(op.ShardArgs)
+				kv.addShardToState(op.ShardArgs)
 				delete(kv.shardsToRecv, op.ShardArgs.Shard)
 				return
 			}
@@ -263,7 +263,7 @@ func (kv *ShardKV) HandleInstallShard(op Op) {
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	if !kv.ShouldStartCommand(args.Key, args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
+	if !kv.shouldStartCommand(args.Key, args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
 		return
 	}
 	resultCh := make(chan Result, 1)
@@ -279,7 +279,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	if isLeader {
 		DPrintf("[%d][%d] Get start [%d] ClientId:%d SeqNumber:%d", kv.gid, kv.me, index, args.ClientId, args.SeqNumber)
 		defer DPrintf("[%d][%d] Get end [%d] ClientId:%d SeqNumber:%d", kv.gid, kv.me, index, args.ClientId, args.SeqNumber)
-		kv.RecordRequestAtIndex(index, kvraft.RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		kv.recordRequestAtIndex(index, kvraft.RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		// block until it's committed
 		select {
 		case err := <-failCh:
@@ -300,7 +300,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	if !kv.ShouldStartCommand(args.Key, args.ClientId, args.SeqNumber, &reply.Err, nil) {
+	if !kv.shouldStartCommand(args.Key, args.ClientId, args.SeqNumber, &reply.Err, nil) {
 		return
 	}
 	resultCh := make(chan Result, 1)
@@ -317,7 +317,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if isLeader {
 		DPrintf("[%d][%d] PutAppend start [%d] ClientId:%d SeqNumber:%d", kv.gid, kv.me, index, args.ClientId, args.SeqNumber)
 		defer DPrintf("[%d][%d] PutAppend end [%d] ClientId:%d SeqNumber:%d", kv.gid, kv.me, index, args.ClientId, args.SeqNumber)
-		kv.RecordRequestAtIndex(index, kvraft.RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
+		kv.recordRequestAtIndex(index, kvraft.RequestId{ClientId: args.ClientId, SeqNumber: args.SeqNumber}, failCh)
 		// block until it's committed
 		select {
 		case err := <-failCh:
@@ -336,7 +336,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
-func (kv *ShardKV) DaemonConfigFetcher() {
+func (kv *ShardKV) daemonConfigFetcher() {
 	// this is only thread modifies config
 	defer kv.configFetcherKilled.Store(true)
 	for !kv.killed() {
@@ -363,7 +363,7 @@ func (kv *ShardKV) DaemonConfigFetcher() {
 	}
 }
 
-func (kv *ShardKV) SendShardImpl(key ShardInfo) {
+func (kv *ShardKV) sendShardImpl(key ShardInfo) {
 	kv.muSendShards.Lock()
 	data, ok := kv.shardsToSend[key]
 	kv.muSendShards.Unlock()
@@ -410,7 +410,7 @@ func (kv *ShardKV) SendShardImpl(key ShardInfo) {
 	})
 }
 
-func (kv *ShardKV) DaemonSendShard() {
+func (kv *ShardKV) daemonSendShard() {
 	defer kv.sendShardsKilled.Store(true)
 	for !kv.killed() {
 		kv.muSendShards.Lock()
@@ -421,12 +421,12 @@ func (kv *ShardKV) DaemonSendShard() {
 		kv.muSendShards.Unlock()
 		// unlock then do RPC
 		for _, s := range shards {
-			kv.SendShardImpl(s)
+			kv.sendShardImpl(s)
 		}
 	}
 }
 
-func (kv *ShardKV) SendShards(shards []int, newConfig *shardctrler.Config) {
+func (kv *ShardKV) sendShards(shards []int, newConfig *shardctrler.Config) {
 	// not lock needed here to access the state
 	shardData := make(map[int]ShardData)
 	for _, shard := range shards {
@@ -471,19 +471,19 @@ func (kv *ShardKV) SendShards(shards []int, newConfig *shardctrler.Config) {
 	kv.muSendShards.Unlock()
 }
 
-func (kv *ShardKV) IsConfigChangeValid(op Op) bool {
+func (kv *ShardKV) isConfigChangeValid(op Op) bool {
 	// this check ensures config update is happening monotonically
 	// also, we can only advance to next config if we have received all pending shards
 	return kv.config.Load().Num+1 == op.NewConfig.Num && len(kv.shardsToRecv) == 0
 }
 
-func (kv *ShardKV) HandleConfigChange(op Op) {
+func (kv *ShardKV) handleConfigChange(op Op) {
 	// not lock needed here to access the state
 	// dedup for config change operation
 	activeConfig := kv.config.Load()
 	shardsToSend := make([]int, 0, shardctrler.NShards)
 	pendingShards := fmt.Sprintf("%v", keys(kv.pendingShards))
-	if !kv.IsConfigChangeValid(op) {
+	if !kv.isConfigChangeValid(op) {
 		return
 	}
 	for shard := 0; shard < shardctrler.NShards; shard++ {
@@ -495,7 +495,7 @@ func (kv *ShardKV) HandleConfigChange(op Op) {
 			if activeConfig.Shards[shard] != kv.gid && op.NewConfig.Shards[shard] == kv.gid {
 				key := ShardInfo{Shard: shard, Num: op.NewConfig.Num}
 				if data, ok := kv.pendingShards[key]; ok {
-					kv.AddShardToState(data)
+					kv.addShardToState(data)
 					delete(kv.pendingShards, key)
 				} else {
 					kv.shardsToRecv[shard] = activeConfig.Shards[shard]
@@ -504,7 +504,7 @@ func (kv *ShardKV) HandleConfigChange(op Op) {
 		}
 	}
 	if len(shardsToSend) != 0 {
-		kv.SendShards(shardsToSend, op.NewConfig)
+		kv.sendShards(shardsToSend, op.NewConfig)
 	}
 	raft.TraceInstant(op.Op, kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
 		"GID":                  kv.gid,
@@ -518,27 +518,27 @@ func (kv *ShardKV) HandleConfigChange(op Op) {
 	kv.config.Store(op.NewConfig)
 }
 
-func (kv *ShardKV) CommandExecutor() {
+func (kv *ShardKV) stateMachineExecutor() {
 	for !kv.killed() {
 		select {
 		// receives committed raft log entry
 		case cmd := <-kv.applyCh:
 			if cmd.TermChanged {
-				kv.FailAllPendingRequests(kvraft.ErrLostLeadership)
+				kv.failAllPendingRequests(kvraft.ErrLostLeadership)
 				continue
 			}
 			if cmd.SnapshotValid && cmd.SnapshotIndex <= kv.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, kv.lastAppliedIndex))
 			}
 			if cmd.SnapshotValid {
-				kv.ReloadFromSnapshot(cmd.Snapshot)
+				kv.reloadFromSnapshot(cmd.Snapshot)
 				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
 			}
 			if !cmd.CommandValid {
 				continue
 			}
-			kv.FailConflictPendingRequests(cmd)
+			kv.failConflictPendingRequests(cmd)
 			if cmd.CommandIndex != -1 && cmd.CommandIndex <= kv.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
 			}
@@ -547,10 +547,10 @@ func (kv *ShardKV) CommandExecutor() {
 			case Nop: // do nothing
 			case ConfigChange:
 				kv.DPrintf("[%d][%d] Config Change [%d] Config: %+v", kv.gid, kv.me, cmd.CommandIndex, *op.NewConfig)
-				kv.HandleConfigChange(op)
+				kv.handleConfigChange(op)
 			case InstallShard:
 				kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard)
-				kv.HandleInstallShard(op)
+				kv.handleInstallShard(op)
 				if op.From == kv.me && op.ResultCh != nil {
 					op.ResultCh <- Result{Valid: true, Value: ""}
 				}
@@ -569,7 +569,7 @@ func (kv *ShardKV) CommandExecutor() {
 						op.ResultCh <- Result{Valid: false}
 					}
 				} else {
-					result := kv.ApplyOperation(op)
+					result := kv.applyOperation(op)
 					// only notify completion when request waiting on same server and channel available
 					// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
 					// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
@@ -586,9 +586,9 @@ func (kv *ShardKV) CommandExecutor() {
 			// and then we can persist the states
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
 				if cmd.CommandIndex != -1 {
-					kv.DoSnapshot(cmd.CommandIndex)
+					kv.doSnapshot(cmd.CommandIndex)
 				} else {
-					kv.DoSnapshot(kv.lastAppliedIndex)
+					kv.doSnapshot(kv.lastAppliedIndex)
 				}
 			}
 		case killed := <-kv.killCh:
@@ -600,7 +600,7 @@ func (kv *ShardKV) CommandExecutor() {
 	kv.executorKilled.Store(true)
 }
 
-func (kv *ShardKV) FailAllPendingRequests(err kvraft.Err) {
+func (kv *ShardKV) failAllPendingRequests(err kvraft.Err) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for k, v := range kv.pendingRequests {
@@ -609,7 +609,7 @@ func (kv *ShardKV) FailAllPendingRequests(err kvraft.Err) {
 	}
 }
 
-func (kv *ShardKV) FailConflictPendingRequests(cmd raft.ApplyMsg) {
+func (kv *ShardKV) failConflictPendingRequests(cmd raft.ApplyMsg) {
 	op := cmd.Command.(Op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -620,7 +620,7 @@ func (kv *ShardKV) FailConflictPendingRequests(cmd raft.ApplyMsg) {
 	delete(kv.pendingRequests, cmd.CommandIndex)
 }
 
-func (kv *ShardKV) ApplyOperation(op Op) string {
+func (kv *ShardKV) applyOperation(op Op) string {
 	shard := key2shard(op.Key)
 	result := ""
 	// No lock need here because the only competing goroutine is read only
@@ -660,7 +660,7 @@ func (kv *ShardKV) ApplyOperation(op Op) string {
 	return result
 }
 
-func (kv *ShardKV) DoSnapshot(index int) {
+func (kv *ShardKV) doSnapshot(index int) {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
 
@@ -711,7 +711,7 @@ func (kv *ShardKV) DoSnapshot(index int) {
 	kv.rf.Snapshot(index, state)
 }
 
-func (kv *ShardKV) ReloadFromSnapshot(data []byte) {
+func (kv *ShardKV) reloadFromSnapshot(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -757,11 +757,11 @@ func (kv *ShardKV) Kill() {
 	kv.killCh <- true
 	kv.condSendShards.Broadcast()
 	kv.mck.Kill()
-	kv.FailAllPendingRequests(kvraft.ErrKilled)
-	raft.CheckKillFinish(10, func() bool { return kv.CheckKillComplete() }, kv)
+	kv.failAllPendingRequests(kvraft.ErrKilled)
+	raft.CheckKillFinish(10, func() bool { return kv.checkKillComplete() }, kv)
 }
 
-func (kv *ShardKV) CheckKillComplete() bool {
+func (kv *ShardKV) checkKillComplete() bool {
 	return kv.executorKilled.Load() && kv.configFetcherKilled.Load() && kv.sendShardsKilled.Load()
 }
 
@@ -829,11 +829,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	cfg := kv.mck.Query(0)
 	kv.config.Store(&cfg)
 	// we might override the config with snapshot
-	kv.ReloadFromSnapshot(persister.ReadSnapshot())
+	kv.reloadFromSnapshot(persister.ReadSnapshot())
 	kv.clientId = nrand()
 	kv.seqCounter.Store(0)
-	go kv.DaemonSendShard()
-	go kv.CommandExecutor()
-	go kv.DaemonConfigFetcher()
+	go kv.daemonSendShard()
+	go kv.stateMachineExecutor()
+	go kv.daemonConfigFetcher()
 	return kv
 }

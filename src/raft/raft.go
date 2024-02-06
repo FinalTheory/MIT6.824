@@ -441,7 +441,7 @@ type LastLogInfo struct {
 	index, term int
 }
 
-func MoreOrEqualUpToDateThan(lhs LastLogInfo, rhs LastLogInfo) bool {
+func moreOrEqualUpToDateThan(lhs LastLogInfo, rhs LastLogInfo) bool {
 	if lhs.index == -1 && rhs.index == -1 {
 		return true
 	} else if lhs.index == -1 {
@@ -461,19 +461,19 @@ func MoreOrEqualUpToDateThan(lhs LastLogInfo, rhs LastLogInfo) bool {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
-	rf.HandleTermUpdateLocked(args.Term)
+	rf.handleTermUpdateLocked(args.Term)
 	reply.Term = rf.currentTerm
 	// candidate's term is valid
 	if args.Term >= rf.currentTerm {
 		if rf.votedFor == args.CandidateId || rf.votedFor == Null {
 			candidateLastLogInfo := LastLogInfo{index: args.LastLogIndex, term: args.LastLogTerm}
-			if MoreOrEqualUpToDateThan(candidateLastLogInfo, rf.GetLastLogInfoLocked()) {
+			if moreOrEqualUpToDateThan(candidateLastLogInfo, rf.getLastLogInfoLocked()) {
 				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
-				rf.ResetElectionTimeout()
+				rf.resetElectionTimeout()
 				TraceInstant("Vote", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 					"voteFor":              args.CandidateId,
-					"selfLastLogInfo":      fmt.Sprintf("%v", rf.GetLastLogInfoLocked()),
+					"selfLastLogInfo":      fmt.Sprintf("%v", rf.getLastLogInfoLocked()),
 					"candidateLastLogInfo": fmt.Sprintf("%v", candidateLastLogInfo),
 				}))
 				rf.persist()
@@ -487,7 +487,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
-	rf.HandleTermUpdateLocked(args.Term)
+	rf.handleTermUpdateLocked(args.Term)
 	eventName := "AppendEntries"
 	if len(args.Entries) == 0 {
 		eventName = "Heartbeat"
@@ -510,7 +510,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// only update timestamp when receiving RPC from current leader
 	if args.Term == rf.currentTerm {
-		rf.ResetElectionTimeout()
+		rf.resetElectionTimeout()
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -518,7 +518,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	if args.Term == rf.currentTerm && rf.role == Candidate {
-		rf.SwitchToFollower()
+		rf.switchToFollower()
 	}
 
 	// PrevLogIndex = PrevLogTerm = -1 when leader log is empty
@@ -556,7 +556,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// we'll simply append logs later
 	}
 
-	rf.AppendNewEntriesLocked(args)
+	rf.appendNewEntriesLocked(args)
 	// commit the new logs
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
@@ -564,7 +564,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		newCommitIndex := min(args.LeaderCommit, lastNewEntryIndex)
 		if newCommitIndex > rf.commitIndex {
 			rf.commitIndex = newCommitIndex
-			rf.ApplyEntryLocked()
+			rf.applyEntryLocked()
 		}
 	}
 	reply.Success = true
@@ -579,7 +579,7 @@ failed:
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.Lock()
 	defer rf.Unlock()
-	rf.HandleTermUpdateLocked(args.Term)
+	rf.handleTermUpdateLocked(args.Term)
 	TraceInstant("InstallSnapshot", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 		"args.LastIncludedIndex": args.LastIncludedIndex,
 		"args.LastIncludedTerm":  args.LastIncludedTerm,
@@ -588,7 +588,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		"snapshotSize":           len(args.Data),
 	}))
 	if args.Term == rf.currentTerm {
-		rf.ResetElectionTimeout()
+		rf.resetElectionTimeout()
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -628,7 +628,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.condApplyMsg.Signal()
 }
 
-func (rf *Raft) AppendNewEntriesLocked(args *AppendEntriesArgs) {
+func (rf *Raft) appendNewEntriesLocked(args *AppendEntriesArgs) {
 	// check if we need to truncate invalid log entries
 	logUpdated := false
 	truncateTo := -1
@@ -729,7 +729,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	index = rf.log.Put(LogEntry{Term: rf.currentTerm, Command: command})
 	term = rf.currentTerm
-	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before SendLogDaemon blocked on wait.
+	// TODO(later): it is possible that this signal could be missed if the very first call of `Start` happens before sendLogDaemon blocked on wait.
 	rf.condAppendEntries.Broadcast()
 	rf.persist()
 	TraceInstant("StartCommand", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
@@ -738,7 +738,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index + 1, term, isLeader
 }
 
-func (rf *Raft) ShouldSendEntriesToServerLocked(server int, isHeartBeat bool) bool {
+func (rf *Raft) shouldSendEntriesToServerLocked(server int, isHeartBeat bool) bool {
 	if rf.killed() {
 		return false
 	}
@@ -748,26 +748,26 @@ func (rf *Raft) ShouldSendEntriesToServerLocked(server int, isHeartBeat bool) bo
 	return rf.log.Length() > rf.nextIndex[server] || isHeartBeat
 }
 
-func (rf *Raft) SendLogDaemon(server int) {
+func (rf *Raft) sendLogDaemon(server int) {
 	for !rf.killed() {
 		rf.Lock()
-		for !rf.ShouldSendEntriesToServerLocked(server, false) && !rf.killed() {
+		for !rf.shouldSendEntriesToServerLocked(server, false) && !rf.killed() {
 			rf.condAppendEntries.Wait()
 		}
 		rf.Unlock()
-		rf.SendLogEntriesToServer(server, false)
+		rf.sendLogEntriesToServer(server, false)
 	}
 	rf.daemonKilled[server].Store(true)
 }
 
-func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
+func (rf *Raft) sendLogEntriesToServer(server int, isHeartBeat bool) {
 	for {
 		sendSnapshot := false
 		var copiedEntries []LogEntry = nil
 		var copiedSnapshot []byte = nil
 
 		rf.Lock()
-		if !rf.ShouldSendEntriesToServerLocked(server, isHeartBeat) {
+		if !rf.shouldSendEntriesToServerLocked(server, isHeartBeat) {
 			rf.Unlock()
 			return
 		}
@@ -798,14 +798,14 @@ func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
 		rf.Unlock()
 
 		if sendSnapshot {
-			if rf.SendSnapshotOnce(server, term, copiedSnapshot, lastIncludedIndex, lastIncludedTerm) || isHeartBeat || rf.killed() {
+			if rf.sendSnapshotOnce(server, term, copiedSnapshot, lastIncludedIndex, lastIncludedTerm) || isHeartBeat || rf.killed() {
 				break
 			} else {
 				// sleep for a while if RPC failed
 				time.Sleep(time.Millisecond * 10)
 			}
 		} else {
-			if rf.SendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) || isHeartBeat || rf.killed() {
+			if rf.sendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) || isHeartBeat || rf.killed() {
 				break
 			} else {
 				// sleep for a while if RPC failed
@@ -815,7 +815,7 @@ func (rf *Raft) SendLogEntriesToServer(server int, isHeartBeat bool) {
 	}
 }
 
-func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entries []LogEntry, prevLogIndex int, prevLogTerm int, nextIndex int) bool {
+func (rf *Raft) sendLogEntriesOnce(server int, term int, commitIndex int, entries []LogEntry, prevLogIndex int, prevLogTerm int, nextIndex int) bool {
 	reply := AppendEntriesReply{}
 	args := AppendEntriesArgs{
 		Term:         term,
@@ -832,7 +832,7 @@ func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entrie
 	rf.Lock()
 	defer rf.Unlock()
 	ignoreResponse := rf.currentTerm != args.Term
-	rf.HandleTermUpdateLocked(reply.Term)
+	rf.handleTermUpdateLocked(reply.Term)
 	if ignoreResponse {
 		// drop the reply and return if term mismatch
 		// we should no longer try to send entries
@@ -852,11 +852,11 @@ func (rf *Raft) SendLogEntriesOnce(server int, term int, commitIndex int, entrie
 		}
 		return false
 	}
-	rf.UpdateCommitIndexLocked()
+	rf.updateCommitIndexLocked()
 	return true
 }
 
-func (rf *Raft) SendSnapshotOnce(server int, term int, snapshot []byte, lastIncludedIndex int, lastIncludedTerm int) bool {
+func (rf *Raft) sendSnapshotOnce(server int, term int, snapshot []byte, lastIncludedIndex int, lastIncludedTerm int) bool {
 	if lastIncludedIndex == -1 || lastIncludedTerm == -1 {
 		panic("invalid last include index/term")
 	}
@@ -869,13 +869,13 @@ func (rf *Raft) SendSnapshotOnce(server int, term int, snapshot []byte, lastIncl
 
 	rf.Lock()
 	defer rf.Unlock()
-	rf.HandleTermUpdateLocked(reply.Term)
+	rf.handleTermUpdateLocked(reply.Term)
 	rf.nextIndex[server] = lastIncludedIndex + 1
 	rf.matchIndex[server] = max(rf.matchIndex[server], lastIncludedIndex)
 	return true
 }
 
-func (rf *Raft) FindTermInLogLocked(start int, term int) int {
+func (rf *Raft) findTermInLogLocked(start int, term int) int {
 	for i := start; rf.log.EntryValidAt(i); i -= 1 {
 		if rf.log.TermAt(i) == term {
 			return i
@@ -890,7 +890,7 @@ func (rf *Raft) getNextIndexBacktrackLocked(args *AppendEntriesArgs, reply *Appe
 	} else {
 		// check if the conflict term in follower also exists in leader
 		// and return the last log entry index of the term
-		idx := rf.FindTermInLogLocked(args.PrevLogIndex, reply.XTerm)
+		idx := rf.findTermInLogLocked(args.PrevLogIndex, reply.XTerm)
 		if idx == -1 {
 			// mismatched term (from follower) not in leader log, we're safe to skip the entire mismatch term in follower log
 			return reply.XIndex
@@ -915,7 +915,7 @@ func (rf *Raft) getNextIndexBacktrackLocked(args *AppendEntriesArgs, reply *Appe
 	}
 }
 
-func (rf *Raft) UpdateCommitIndexLocked() {
+func (rf *Raft) updateCommitIndexLocked() {
 	// only log entries <= commitIndex can be trimmed to snapshot
 	// thus it's guaranteed entry with index commitIndex + 1 is still available in log
 	for n := rf.commitIndex + 1; n < rf.log.Length(); n += 1 {
@@ -929,14 +929,14 @@ func (rf *Raft) UpdateCommitIndexLocked() {
 				count += 1
 			}
 		}
-		if count >= rf.MajorityNum() {
+		if count >= rf.majorityNum() {
 			rf.commitIndex = n
 		}
 	}
-	rf.ApplyEntryLocked()
+	rf.applyEntryLocked()
 }
 
-func (rf *Raft) ApplyEntryLocked() {
+func (rf *Raft) applyEntryLocked() {
 	lastApplied := rf.lastApplied
 	commitIndex := rf.commitIndex
 	entries := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
@@ -960,7 +960,7 @@ func (rf *Raft) ApplyEntryLocked() {
 	}
 }
 
-func (rf *Raft) DaemonApplyMsg() {
+func (rf *Raft) daemonApplyMsg() {
 	defer rf.applierKilled.Store(true)
 	for !rf.killed() {
 		rf.Lock()
@@ -982,7 +982,7 @@ func (rf *Raft) DaemonApplyMsg() {
 	}
 }
 
-func (rf *Raft) CheckKillComplete() bool {
+func (rf *Raft) checkKillComplete() bool {
 	if !rf.tickerKilled.Load() {
 		return false
 	}
@@ -1016,7 +1016,7 @@ func (rf *Raft) Kill() {
 	for i := 0; i < rf.killChSize; i += 1 {
 		rf.killCh <- true
 	}
-	CheckKillFinish(10, func() bool { return rf.CheckKillComplete() }, rf)
+	CheckKillFinish(10, func() bool { return rf.checkKillComplete() }, rf)
 }
 
 func (rf *Raft) killed() bool {
@@ -1028,7 +1028,7 @@ func (rf *Raft) getGID() int {
 	return int(atomic.LoadInt32(&rf.GID))
 }
 
-func (rf *Raft) ResetElectionTimeout() {
+func (rf *Raft) resetElectionTimeout() {
 	// pause for a random amount of time between 200 and 400
 	// milliseconds.
 	timeout := 400 + (rand.Int63() % 400)
@@ -1044,14 +1044,14 @@ func (rf *Raft) ticker() {
 		}
 		time.Sleep(time.Millisecond * 10)
 		if time.Now().UnixMilli() > atomic.LoadInt64(&rf.nextTimeout) {
-			rf.ResetElectionTimeout()
-			rf.StartNewElection()
+			rf.resetElectionTimeout()
+			rf.startNewElection()
 		}
 	}
 	rf.tickerKilled.Store(true)
 }
 
-func (rf *Raft) StartNewElection() {
+func (rf *Raft) startNewElection() {
 	if rf.killed() {
 		return
 	}
@@ -1064,22 +1064,22 @@ func (rf *Raft) StartNewElection() {
 	// it will be persisted during switch to candidate
 	rf.currentTerm += 1
 	TraceInstant("NewElection", rf.me, rf.getGID(), time.Now().UnixMicro(), rf.GetTraceState())
-	rf.SwitchToCandidate()
-	info := rf.GetLastLogInfoLocked()
+	rf.switchToCandidate()
+	info := rf.getLastLogInfoLocked()
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			// request for vote in parallel
-			go rf.RequestVoteFromServer(i, info, rf.currentTerm)
+			go rf.requestVoteFromServer(i, info, rf.currentTerm)
 		}
 	}
 }
 
-func (rf *Raft) GetLastLogInfoLocked() LastLogInfo {
+func (rf *Raft) getLastLogInfoLocked() LastLogInfo {
 	return LastLogInfo{index: rf.log.LastLogIndex(), term: rf.log.LastLogTerm()}
 }
 
-func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
+func (rf *Raft) requestVoteFromServer(server int, info LastLogInfo, term int) {
 	arg := RequestVoteArgs{
 		Term:         term,
 		CandidateId:  rf.me,
@@ -1095,9 +1095,9 @@ func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
 	defer rf.Unlock()
 	// ignore the response if already in next term
 	ignoreResponse := arg.Term != rf.currentTerm
-	rf.HandleTermUpdateLocked(reply.Term)
+	rf.handleTermUpdateLocked(reply.Term)
 	if !ignoreResponse && reply.VoteGranted {
-		rf.HandleVoteGrantedLocked()
+		rf.handleVoteGrantedLocked()
 		TraceInstant("GetVote", rf.me, rf.getGID(), time.Now().UnixMicro(), merge(rf.GetTraceState(), map[string]any{
 			"voteFrom":         server,
 			"currentVoteCount": rf.voteCount,
@@ -1108,7 +1108,7 @@ func (rf *Raft) RequestVoteFromServer(server int, info LastLogInfo, term int) {
 	}
 }
 
-func (rf *Raft) SwitchToCandidate() {
+func (rf *Raft) switchToCandidate() {
 	now := time.Now().UnixMicro()
 	if rf.role == Leader {
 		panic("Leader can not become candidate")
@@ -1125,7 +1125,7 @@ func (rf *Raft) SwitchToCandidate() {
 	rf.persist()
 }
 
-func (rf *Raft) SwitchToFollower() {
+func (rf *Raft) switchToFollower() {
 	now := time.Now().UnixMicro()
 	if rf.role == Leader {
 		TraceEventEnd(!rf.killed(), Leader.String(), rf.me, rf.getGID(), now, nil)
@@ -1142,7 +1142,7 @@ func (rf *Raft) SwitchToFollower() {
 	rf.persist()
 }
 
-func (rf *Raft) SwitchToLeader() {
+func (rf *Raft) switchToLeader() {
 	if rf.role == Follower {
 		panic("Follower can not become leader")
 	}
@@ -1178,32 +1178,32 @@ func (rf *Raft) heartbeat() {
 func (rf *Raft) heartbeatImpl() {
 	for i := 0; i < len(rf.peers); i += 1 {
 		if i != rf.me {
-			go rf.SendLogEntriesToServer(i, true)
+			go rf.sendLogEntriesToServer(i, true)
 		}
 	}
 }
 
-func (rf *Raft) HandleTermUpdateLocked(term int) {
+func (rf *Raft) handleTermUpdateLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
-		rf.SwitchToFollower()
+		rf.switchToFollower()
 		msg := ApplyMsg{TermChanged: true, CommandValid: false}
 		rf.msgQueue = append(rf.msgQueue, msg)
 		rf.condApplyMsg.Signal()
 	}
 }
 
-func (rf *Raft) HandleVoteGrantedLocked() {
+func (rf *Raft) handleVoteGrantedLocked() {
 	if rf.role != Candidate {
 		return
 	}
 	rf.voteCount += 1
-	if rf.voteCount >= rf.MajorityNum() {
-		rf.SwitchToLeader()
+	if rf.voteCount >= rf.majorityNum() {
+		rf.switchToLeader()
 	}
 }
 
-func (rf *Raft) MajorityNum() int {
+func (rf *Raft) majorityNum() int {
 	return len(rf.peers)/2 + 1
 }
 
@@ -1231,7 +1231,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = LogContainer{Data: make([]LogEntry, 0, 512), StartFrom: 0, LastIncludedTerm: -1, LastIncludedIndex: -1}
 	rf.snapshot = nil
 
-	rf.ResetElectionTimeout()
+	rf.resetElectionTimeout()
 	rf.role = Follower
 	rf.voteCount = 0
 	rf.votedFor = Null
@@ -1247,7 +1247,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = 0
 		rf.matchIndex[i] = -1
 		if i != rf.me {
-			go rf.SendLogDaemon(i)
+			go rf.sendLogDaemon(i)
 		}
 	}
 
@@ -1261,7 +1261,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeat()
-	go rf.DaemonApplyMsg()
+	go rf.daemonApplyMsg()
 
 	return rf
 }

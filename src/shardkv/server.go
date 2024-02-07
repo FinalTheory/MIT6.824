@@ -378,17 +378,15 @@ func (kv *ShardKV) sendShardImpl(key ShardInfo) {
 		var reply InstallShardReply
 		ok := srv.Call("ShardKV.InstallShard", &data.Arg, &reply)
 		if ok && reply.Success == true {
-			raft.TraceInstant("SendShard", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
-				"GID":     kv.gid,
-				"dataLen": fmt.Sprintf("%+v", length(data)),
-				"config":  fmt.Sprintf("%+v", *kv.config.Load()),
-			})
 			kv.muSendShards.Lock()
 			delete(kv.shardsToSend, data.Arg.ShardInfo())
-			sendNop := false
-			if len(kv.shardsToSend) == 0 {
-				sendNop = true
-			}
+			sendNop := len(kv.shardsToSend) == 0
+			raft.TraceInstant("SendShard", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
+				"GID":             kv.gid,
+				"dataLen":         fmt.Sprintf("%+v", length(data)),
+				"config":          fmt.Sprintf("%+v", *kv.config.Load()),
+				"remainingShards": fmt.Sprintf("%+v", keys(kv.shardsToSend)),
+			})
 			kv.muSendShards.Unlock()
 			// this is only to pass challenge 1 shard deletion
 			// when all shards are sent, we'll need to trigger a snapshot to reduce its size

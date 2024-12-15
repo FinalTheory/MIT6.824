@@ -1,1 +1,1 @@
-[https://blog.finaltheory.me/](https://blog.finaltheory.me/note/MIT6.828-Notes.html)
+[Raft分布式一致性协议：从入门到崩溃](https://blog.finaltheory.me/research/Raft.html)

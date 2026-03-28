@@ -1,18 +1,19 @@
 package shardkv
 
 import (
-	"6.5840/kvraft"
-	"6.5840/labrpc"
-	"6.5840/shardctrler"
 	"bytes"
 	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.5840/kvraft"
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
+	"6.5840/shardctrler"
 )
-import "6.5840/raft"
-import "sync"
-import "6.5840/labgob"
 
 const Debug = false
 
@@ -118,11 +119,17 @@ type ShardKV struct {
 	executorKilled      atomic.Bool
 	configFetcherKilled atomic.Bool
 	sendShardsKilled    atomic.Bool
+
+	// states introduced for 2PC
+	txnStateMap  map[string]*TxnState
+	txnStateLock sync.Mutex
+	// Key => Set(TxnID)
+	txnReadSet  map[string]map[string]struct{}
+	txnWriteSet map[string]map[string]struct{}
 }
 
 func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
-	_, isLeader := kv.rf.GetState()
-	if isLeader {
+	if _, isLeader := kv.rf.GetState(); isLeader {
 		DPrintf(format, a...)
 	}
 	return
@@ -130,8 +137,7 @@ func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
 
 // shouldStartCommand returns whether to accept this RPC
 func (kv *ShardKV) shouldStartCommand(key string, clientId int64, newSeq int32, err *Err, value *string) bool {
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
 		*err = ErrWrongLeader
 		return false
 	}
@@ -336,6 +342,179 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
+func (kv *ShardKV) lockTxnKeys(txnID string, operations []TxnOperation) {
+	readSet := make(map[string]struct{})
+	writeSet := make(map[string]struct{})
+	addTxnKey := func(lockSet map[string]map[string]struct{}, key string) {
+		if _, ok := lockSet[key]; !ok {
+			lockSet[key] = make(map[string]struct{})
+		}
+		lockSet[key][txnID] = struct{}{}
+	}
+	for _, op := range operations {
+		if op.Op == kvraft.GetOp {
+			readSet[op.Key] = struct{}{}
+		} else {
+			writeSet[op.Key] = struct{}{}
+		}
+	}
+	for key := range writeSet {
+		delete(readSet, key)
+	}
+	for key := range readSet {
+		addTxnKey(kv.txnReadSet, key)
+	}
+	for key := range writeSet {
+		addTxnKey(kv.txnWriteSet, key)
+	}
+}
+
+func (kv *ShardKV) unlockTxnKeys(txnID string, operations []TxnOperation) {
+	readSet := make(map[string]struct{})
+	writeSet := make(map[string]struct{})
+	removeTxnKey := func(lockSet map[string]map[string]struct{}, key string) {
+		if holders, ok := lockSet[key]; ok {
+			delete(holders, txnID)
+			if len(holders) == 0 {
+				delete(lockSet, key)
+			}
+		}
+	}
+	for _, op := range operations {
+		if op.Op == kvraft.GetOp {
+			readSet[op.Key] = struct{}{}
+		} else {
+			writeSet[op.Key] = struct{}{}
+		}
+	}
+	for key := range writeSet {
+		delete(readSet, key)
+	}
+	for key := range readSet {
+		removeTxnKey(kv.txnReadSet, key)
+	}
+	for key := range writeSet {
+		removeTxnKey(kv.txnWriteSet, key)
+	}
+}
+
+func (kv *ShardKV) txnPrepareCheck(tnxId string) (Err, bool) {
+	kv.txnStateLock.Lock()
+	defer kv.txnStateLock.Unlock()
+	state, exist := kv.txnStateMap[tnxId]
+	if exist {
+		if state.Status == TxnStatusAborted {
+			return ErrTxnAborted, true
+		} else {
+			return OK, true
+		}
+	}
+	return "", false
+}
+
+func (kv *ShardKV) Prepare(args *PrepareArgs, reply *PrepareReply) {
+	err, earlyReturn := kv.txnPrepareCheck(args.TxnId)
+	if earlyReturn {
+		reply.Err = err
+		return
+	}
+	// if state not persisted yet, we do leader check and only leader will persist an OP into state machine
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	cmd := TxnCmd{
+		Type:       TxnPrepare,
+		TxnId:      args.TxnId,
+		Operations: args.TxnOperations,
+		Config:     args.Config,
+		ResultCh:   make(chan TxnResult, 1),
+	}
+	result, ok := PersistCommand(kv.rf, cmd, cmd.ResultCh, func() {
+		reply.Err = ErrWrongLeader
+	})
+	if !ok {
+		return
+	}
+	reply.Err = result.Err
+}
+
+func (kv *ShardKV) Commit(args *CommitArgs, reply *CommitReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	shouldPersistCommand := func() bool {
+		kv.txnStateLock.Lock()
+		defer kv.txnStateLock.Unlock()
+		state, exist := kv.txnStateMap[args.TxnId]
+		if !exist {
+			reply.Err = ErrWrongLeader
+			return false
+		} else {
+			if state.Status == TxnStatusCommitted {
+				reply.Err = OK
+				reply.Values = state.Values
+				return false
+			}
+			if state.Status == TxnStatusAborted {
+				panic("commit on aborted txn")
+			}
+		}
+		return true
+	}
+	if !shouldPersistCommand() {
+		return
+	}
+	cmd := TxnCmd{
+		Type:     TxnCommit,
+		TxnId:    args.TxnId,
+		ResultCh: make(chan TxnResult, 1),
+	}
+	result, ok := PersistCommand(kv.rf, cmd, cmd.ResultCh, func() {
+		reply.Err = ErrWrongLeader
+	})
+	if ok {
+		*reply = result
+	}
+}
+
+func (kv *ShardKV) Abort(args *AbortArgs, reply *AbortReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	shouldPersistCommand := func() bool {
+		kv.txnStateLock.Lock()
+		defer kv.txnStateLock.Unlock()
+		state, exist := kv.txnStateMap[args.TxnId]
+		if exist {
+			if state.Status == TxnStatusCommitted {
+				panic("abort on committed txn")
+			}
+			if state.Status == TxnStatusAborted {
+				reply.Err = OK
+				return false
+			}
+		}
+		return true
+	}
+	if !shouldPersistCommand() {
+		return
+	}
+	cmd := TxnCmd{
+		Type:     TxnAbort,
+		TxnId:    args.TxnId,
+		ResultCh: make(chan TxnResult, 1),
+	}
+	result, ok := PersistCommand(kv.rf, cmd, cmd.ResultCh, func() {
+		reply.Err = ErrWrongLeader
+	})
+	if ok {
+		reply.Err = result.Err
+	}
+}
+
 func (kv *ShardKV) daemonConfigFetcher() {
 	// this is only thread modifies config
 	defer kv.configFetcherKilled.Store(true)
@@ -470,9 +649,40 @@ func (kv *ShardKV) sendShards(shards []int, newConfig *shardctrler.Config) {
 }
 
 func (kv *ShardKV) isConfigChangeValid(op Op) bool {
-	// this check ensures config update is happening monotonically
-	// also, we can only advance to next config if we have received all pending shards
-	return kv.config.Load().Num+1 == op.NewConfig.Num && len(kv.shardsToRecv) == 0
+	// Config changes must be applied one-by-one, and we cannot advance while
+	// some shards for the next config are still missing locally.
+	activeConfig := kv.config.Load()
+	if activeConfig.Num+1 != op.NewConfig.Num || len(kv.shardsToRecv) != 0 {
+		return false
+	}
+	// For txn support, we add one more guard here: if this config would move out
+	// some shards currently touched by in-flight txn lock sets, we delay applying
+	// the config. This keeps the old owner serving Commit/Abort for prepared txns
+	// instead of migrating those shards away too early.
+	shardsToSend := make(map[int]struct{})
+	for shard := 0; shard < shardctrler.NShards; shard++ {
+		if activeConfig.Shards[shard] == kv.gid && op.NewConfig.Shards[shard] != kv.gid {
+			shardsToSend[shard] = struct{}{}
+		}
+	}
+	if len(shardsToSend) == 0 {
+		return true
+	}
+	check := func(key string) bool {
+		_, ok := shardsToSend[key2shard(key)]
+		return ok
+	}
+	for key := range kv.txnReadSet {
+		if check(key) {
+			return false
+		}
+	}
+	for key := range kv.txnWriteSet {
+		if check(key) {
+			return false
+		}
+	}
+	return true
 }
 
 func (kv *ShardKV) handleConfigChange(op Op) {
@@ -517,6 +727,7 @@ func (kv *ShardKV) handleConfigChange(op Op) {
 }
 
 func (kv *ShardKV) stateMachineExecutor() {
+	defer kv.executorKilled.Store(true)
 	for !kv.killed() {
 		select {
 		// receives committed raft log entry
@@ -540,43 +751,51 @@ func (kv *ShardKV) stateMachineExecutor() {
 			if cmd.CommandIndex != -1 && cmd.CommandIndex <= kv.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
 			}
-			op := cmd.Command.(Op)
-			switch op.Op {
-			case Nop: // do nothing
-			case ConfigChange:
-				kv.DPrintf("[%d][%d] Config Change [%d] Config: %+v", kv.gid, kv.me, cmd.CommandIndex, *op.NewConfig)
-				kv.handleConfigChange(op)
-			case InstallShard:
-				kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard)
-				kv.handleInstallShard(op)
-				if op.From == kv.me && op.ResultCh != nil {
-					op.ResultCh <- Result{Valid: true, Value: ""}
+			switch cmd.Command.(type) {
+			case Op:
+				op := cmd.Command.(Op)
+				switch op.Op {
+				case Nop: // do nothing
+				case ConfigChange:
+					kv.DPrintf("[%d][%d] Config Change [%d] Config: %+v", kv.gid, kv.me, cmd.CommandIndex, *op.NewConfig)
+					kv.handleConfigChange(op)
+				case InstallShard:
+					kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard)
+					kv.handleInstallShard(op)
+					if op.From == kv.me && op.ResultCh != nil {
+						op.ResultCh <- Result{Valid: true, Value: ""}
+					}
+				default:
+					kv.DPrintf("[%d][%d] Apply command [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
+					cfg := kv.config.Load()
+					shard := key2shard(op.Key)
+					// do not apply operation if not owing the shard or waiting to receive this shard
+					// then the client request will fail and it will finally retry
+					_, shardNotReady := kv.shardsToRecv[shard]
+					// it is tricky here that if we update the dedup stable status, we should also increase the seqNumber once client received ErrWrongGroup
+					// we have to choose to do both or neither, otherwise the previous failed request won't be properly retried once we're ready to serve this shard
+					if cfg.Shards[shard] != kv.gid || shardNotReady {
+						if op.From == kv.me && op.ResultCh != nil {
+							kv.DPrintf("[%d][%d] Apply failed [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
+							op.ResultCh <- Result{Valid: false}
+						}
+					} else {
+						result := kv.applyOperation(op)
+						// only notify completion when request waiting on same server and channel available
+						// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
+						// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
+						// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
+						if op.From == kv.me && op.ResultCh != nil {
+							op.ResultCh <- Result{Valid: true, Value: result}
+						}
+					}
 				}
+			case TxnCmd:
+				kv.applyTxnOperation(cmd.Command.(TxnCmd))
 			default:
-				kv.DPrintf("[%d][%d] Apply command [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
-				cfg := kv.config.Load()
-				shard := key2shard(op.Key)
-				// do not apply operation if not owing the shard or waiting to receive this shard
-				// then the client request will fail and it will finally retry
-				_, shardNotReady := kv.shardsToRecv[shard]
-				// it is tricky here that if we update the dedup stable status, we should also increase the seqNumber once client received ErrWrongGroup
-				// we have to choose to do both or neither, otherwise the previous failed request won't be properly retried once we're ready to serve this shard
-				if cfg.Shards[shard] != kv.gid || shardNotReady {
-					if op.From == kv.me && op.ResultCh != nil {
-						kv.DPrintf("[%d][%d] Apply failed [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
-						op.ResultCh <- Result{Valid: false}
-					}
-				} else {
-					result := kv.applyOperation(op)
-					// only notify completion when request waiting on same server and channel available
-					// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
-					// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
-					// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
-					if op.From == kv.me && op.ResultCh != nil {
-						op.ResultCh <- Result{Valid: true, Value: result}
-					}
-				}
+				panic("unknown command type")
 			}
+
 			// we can only update the last applied index after we successfully apply the operation
 			if cmd.CommandIndex != -1 {
 				kv.lastAppliedIndex = cmd.CommandIndex
@@ -591,11 +810,10 @@ func (kv *ShardKV) stateMachineExecutor() {
 			}
 		case killed := <-kv.killCh:
 			if killed {
-				break
+				return
 			}
 		}
 	}
-	kv.executorKilled.Store(true)
 }
 
 func (kv *ShardKV) failAllPendingRequests(err kvraft.Err) {
@@ -608,12 +826,19 @@ func (kv *ShardKV) failAllPendingRequests(err kvraft.Err) {
 }
 
 func (kv *ShardKV) failConflictPendingRequests(cmd raft.ApplyMsg) {
-	op := cmd.Command.(Op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	info, ok := kv.pendingRequests[cmd.CommandIndex]
-	if ok && info.RequestId != op.RequestId() {
-		info.FailCh <- kvraft.ErrLostLeadership
+	if ok {
+		switch cmd.Command.(type) {
+		case Op:
+			op := cmd.Command.(Op)
+			if info.RequestId != op.RequestId() {
+				info.FailCh <- kvraft.ErrLostLeadership
+			}
+		default:
+			info.FailCh <- kvraft.ErrLostLeadership
+		}
 	}
 	delete(kv.pendingRequests, cmd.CommandIndex)
 }
@@ -658,6 +883,183 @@ func (kv *ShardKV) applyOperation(op Op) string {
 	return result
 }
 
+func (kv *ShardKV) applyTxnOperation(cmd TxnCmd) {
+	switch cmd.Type {
+	case TxnPrepare:
+		kv.applyTxnPrepare(cmd)
+	case TxnCommit:
+		kv.applyTxnCommit(cmd)
+	case TxnAbort:
+		kv.applyTxnAbort(cmd)
+	default:
+		panic("unknown txn op")
+	}
+}
+
+func (kv *ShardKV) applyTxnPrepare(cmd TxnCmd) {
+	// 1. idempotency check
+	err, exist := kv.txnPrepareCheck(cmd.TxnId)
+	if exist {
+		SafeWriteChannel(cmd.ResultCh, TxnResult{Err: err})
+		return
+	}
+	doAbort := func() {
+		kv.txnStateLock.Lock()
+		kv.txnStateMap[cmd.TxnId] = &TxnState{
+			Status: TxnStatusAborted,
+		}
+		kv.txnStateLock.Unlock()
+		SafeWriteChannel(cmd.ResultCh, TxnResult{Err: ErrTxnAborted})
+	}
+	// 2. config version check
+	cfg := kv.config.Load()
+	if cfg.Num != cmd.Config.Num {
+		doAbort()
+		return
+	}
+	// 3. Shard validation
+	for _, op := range cmd.Operations {
+		shard := key2shard(op.Key)
+		_, shardNotReady := kv.shardsToRecv[shard]
+		if cfg.Shards[shard] != kv.gid || shardNotReady {
+			doAbort()
+			return
+		}
+	}
+	checkConflictExist := func(key string, s *map[string]map[string]struct{}) bool {
+		txnId, exist := (*s)[key]
+		if exist && len(txnId) > 0 {
+			doAbort()
+			return true
+		}
+		return false
+	}
+	// 4. Key conflict check
+	for _, op := range cmd.Operations {
+		if op.Op == kvraft.GetOp {
+			if checkConflictExist(op.Key, &kv.txnWriteSet) {
+				return
+			}
+		} else {
+			// PUT or APPEND
+			if checkConflictExist(op.Key, &kv.txnReadSet) || checkConflictExist(op.Key, &kv.txnWriteSet) {
+				return
+			}
+		}
+	}
+	// 5. When succeed:
+	kv.lockTxnKeys(cmd.TxnId, cmd.Operations)
+	kv.txnStateLock.Lock()
+	kv.txnStateMap[cmd.TxnId] = &TxnState{
+		Status:     TxnStatusPrepared,
+		Operations: cmd.Operations,
+	}
+	kv.txnStateLock.Unlock()
+	SafeWriteChannel(cmd.ResultCh, TxnResult{Err: OK})
+}
+
+func (kv *ShardKV) applyTxnCommit(cmd TxnCmd) {
+	shouldApplyCommand := func() bool {
+		kv.txnStateLock.Lock()
+		defer kv.txnStateLock.Unlock()
+		state, exist := kv.txnStateMap[cmd.TxnId]
+		if !exist {
+			panic("commit on unknown txn")
+		}
+		switch state.Status {
+		case TxnStatusPrepared:
+			return true
+		case TxnStatusCommitted:
+			SafeWriteChannel(cmd.ResultCh, TxnResult{Err: OK, Values: state.Values})
+			return false
+		case TxnStatusAborted:
+			panic("commit on aborted txn")
+		default:
+			panic("unknown txn status")
+		}
+	}
+	// 1. idempotency check
+	if !shouldApplyCommand() {
+		return
+	}
+	// 2. do actual execution
+	kv.txnStateLock.Lock()
+	txnState := kv.txnStateMap[cmd.TxnId]
+	txnOperations := txnState.Operations
+	kv.txnStateLock.Unlock()
+	commitValues := make([]string, 0, len(txnOperations))
+	for _, op := range txnOperations {
+		if op.Op == kvraft.PutOp {
+			kv.state[op.Key] = op.Value
+			commitValues = append(commitValues, op.Value)
+		} else {
+			curVal, ok_ := kv.state[op.Key]
+			if !ok_ {
+				curVal = ""
+			}
+			switch op.Op {
+			case kvraft.AppendOp:
+				value := curVal + op.Value
+				kv.state[op.Key] = value
+				commitValues = append(commitValues, value)
+			case kvraft.GetOp:
+				commitValues = append(commitValues, curVal)
+			}
+		}
+	}
+	// 3. when succeed:
+	kv.unlockTxnKeys(cmd.TxnId, txnOperations)
+	kv.txnStateLock.Lock()
+	defer kv.txnStateLock.Unlock()
+	txnState.Status = TxnStatusCommitted
+	txnState.Values = commitValues
+	SafeWriteChannel(cmd.ResultCh, TxnResult{Err: OK, Values: txnState.Values})
+}
+
+func (kv *ShardKV) applyTxnAbort(cmd TxnCmd) {
+	shouldApplyCommand := func() bool {
+		kv.txnStateLock.Lock()
+		defer kv.txnStateLock.Unlock()
+		state, ok := kv.txnStateMap[cmd.TxnId]
+		if !ok {
+			return true
+		}
+		switch state.Status {
+		case TxnStatusPrepared:
+			return true
+		case TxnStatusCommitted:
+			panic("abort on committed txn")
+		case TxnStatusAborted:
+			SafeWriteChannel(cmd.ResultCh, TxnResult{Err: OK})
+			return false
+		default:
+			panic("unknown txn status")
+		}
+	}
+	// 1. idempotency check
+	if !shouldApplyCommand() {
+		return
+	}
+	// 2. unlock keys
+	kv.txnStateLock.Lock()
+	txnOperations := make([]TxnOperation, 0)
+	txnState, ok := kv.txnStateMap[cmd.TxnId]
+	if ok {
+		txnOperations = txnState.Operations
+	}
+	kv.txnStateLock.Unlock()
+	kv.unlockTxnKeys(cmd.TxnId, txnOperations)
+	// 3. do abort
+	kv.txnStateLock.Lock()
+	if ok {
+		txnState.Status = TxnStatusAborted
+	} else {
+		kv.txnStateMap[cmd.TxnId] = &TxnState{Status: TxnStatusAborted}
+	}
+	kv.txnStateLock.Unlock()
+	SafeWriteChannel(cmd.ResultCh, TxnResult{Err: OK})
+}
+
 func (kv *ShardKV) doSnapshot(index int) {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
@@ -694,6 +1096,15 @@ func (kv *ShardKV) doSnapshot(index int) {
 	}
 	kv.muSendShards.Unlock()
 	shardsToSendLen := buf.Len() - prevLen
+	if err := e.Encode(kv.txnStateMap); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(kv.txnReadSet); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(kv.txnWriteSet); err != nil {
+		log.Fatal(err)
+	}
 	state := buf.Bytes()
 	raft.TraceInstant("AppSnapshot", kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
 		"stateLen":        stateLen,
@@ -721,8 +1132,20 @@ func (kv *ShardKV) reloadFromSnapshot(data []byte) {
 	var cfg shardctrler.Config
 	var shardsToRecv map[int]int
 	var pendingShards map[ShardInfo]InstallShardArgs
+	var txnStateMap map[string]*TxnState
+	var txnReadSet map[string]map[string]struct{}
+	var txnWriteSet map[string]map[string]struct{}
 	var shardsToSend map[ShardInfo]ShardData
-	if d.Decode(&lastAppliedIndex) != nil || d.Decode(&cfg) != nil || d.Decode(&shardsToRecv) != nil || d.Decode(&state) != nil || d.Decode(&dedupTable) != nil || d.Decode(&pendingShards) != nil || d.Decode(&shardsToSend) != nil {
+	if d.Decode(&lastAppliedIndex) != nil ||
+		d.Decode(&cfg) != nil ||
+		d.Decode(&shardsToRecv) != nil ||
+		d.Decode(&state) != nil ||
+		d.Decode(&dedupTable) != nil ||
+		d.Decode(&pendingShards) != nil ||
+		d.Decode(&shardsToSend) != nil ||
+		d.Decode(&txnStateMap) != nil ||
+		d.Decode(&txnReadSet) != nil ||
+		d.Decode(&txnWriteSet) != nil {
 		panic("Failed to reload persisted snapshot into application.")
 	}
 	// configuration update related states
@@ -739,6 +1162,11 @@ func (kv *ShardKV) reloadFromSnapshot(data []byte) {
 	kv.dedup = dedupTable
 	kv.lastAppliedIndex = lastAppliedIndex
 	kv.rwLock.Unlock()
+	kv.txnStateLock.Lock()
+	kv.txnStateMap = txnStateMap
+	kv.txnReadSet = txnReadSet
+	kv.txnWriteSet = txnWriteSet
+	kv.txnStateLock.Unlock()
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -757,6 +1185,10 @@ func (kv *ShardKV) Kill() {
 	kv.mck.Kill()
 	kv.failAllPendingRequests(kvraft.ErrKilled)
 	raft.CheckKillFinish(10, func() bool { return kv.checkKillComplete() }, kv)
+}
+
+func (kv *ShardKV) Raft() *raft.Raft {
+	return kv.rf
 }
 
 func (kv *ShardKV) checkKillComplete() bool {
@@ -798,6 +1230,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(TxnCmd{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -818,6 +1251,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.state = make(map[string]string)
 	kv.dedup = make(map[DedupKey]DedupEntry)
 	kv.pendingRequests = make(map[int]kvraft.RequestInfo)
+	kv.txnStateMap = make(map[string]*TxnState)
+	kv.txnReadSet = make(map[string]map[string]struct{})
+	kv.txnWriteSet = make(map[string]map[string]struct{})
 	// config migration related
 	kv.shardsToRecv = make(map[int]int)
 	kv.shardsToSend = make(map[ShardInfo]ShardData)

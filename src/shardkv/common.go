@@ -1,5 +1,12 @@
 package shardkv
 
+import (
+	"time"
+
+	"6.5840/raft"
+	"6.5840/shardctrler"
+)
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -9,11 +16,16 @@ package shardkv
 // You will have to modify these definitions.
 //
 
+type Err string
+
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK             Err = "OK"
+	ErrNoKey       Err = "ErrNoKey"
+	ErrWrongGroup  Err = "ErrWrongGroup"
+	ErrWrongLeader Err = "ErrWrongLeader"
+	// errors for txn
+	ErrTxnAborted  Err = "ErrTxnAborted"
+	ErrTxnInFlight Err = "ErrTxnInFlight"
 )
 
 const (
@@ -21,8 +33,6 @@ const (
 	InstallShard = "InstallShard"
 	Nop          = "Nop"
 )
-
-type Err string
 
 // Put or Append
 type PutAppendArgs struct {
@@ -71,4 +81,127 @@ type ShardInfo struct {
 
 func (args *InstallShardArgs) ShardInfo() ShardInfo {
 	return ShardInfo{Shard: args.Shard, Num: args.Num}
+}
+
+type TxnOpType string
+
+const (
+	TxnPrepare TxnOpType = "TxnPrepare"
+	TxnCommit  TxnOpType = "TxnCommit"
+	TxnAbort   TxnOpType = "TxnAbort"
+)
+
+type TxnCmd struct {
+	Type       TxnOpType
+	TxnId      string
+	Operations []TxnOperation
+	Config     shardctrler.Config
+	ResultCh   chan TxnResult
+}
+
+type TxnStatus string
+
+type TxnState struct {
+	Status     TxnStatus
+	Operations []TxnOperation
+	Values     []string
+}
+
+type TxnResult struct {
+	Err    Err
+	Values []string
+}
+
+// states in participants are slightly different than coordinator
+// thus we use separate definition in different namespace
+const (
+	TxnStatusPrepared  TxnStatus = "TxnStatusPrepared"
+	TxnStatusCommitted TxnStatus = "TxnStatusCommitted"
+	TxnStatusAborted   TxnStatus = "TxnStatusAborted"
+)
+
+type TxnOperation struct {
+	Key   string
+	Value string
+	Op    string // "Get" or "Put" or "Append"
+}
+
+type PrepareArgs struct {
+	TxnId         string
+	TxnOperations []TxnOperation
+	Config        shardctrler.Config
+}
+
+type PrepareReply struct {
+	Err Err
+}
+
+type CommitArgs struct {
+	TxnId string
+}
+
+type CommitReply = TxnResult
+
+type AbortArgs = CommitArgs
+
+type AbortReply = PrepareReply
+
+const (
+	NewCmdTimeOut = 500 * time.Millisecond
+)
+
+// PersistCommand keeps retrying rf.Start(cmd) until either:
+//  1. the current node loses leadership, in which case it runs
+//     notLeaderCallback and returns (zeroValue, false), or
+//  2. the command is applied and resultCh yields a result before timeout,
+//     in which case it returns (result, true).
+//
+// The returned bool therefore means "this process successfully observed the
+// command result while still being leader", not "the protocol as a whole has
+// permanently succeeded".
+func PersistCommand[T any](rf *raft.Raft, cmd interface{}, resultCh <-chan T, notLeaderCallback func()) (T, bool) {
+	// use while loop to make sure op is persisted
+	for {
+		var zero T
+		_, _, isLeader := rf.Start(cmd)
+		if !isLeader {
+			notLeaderCallback()
+			return zero, false
+		}
+		result, ok := RecvWithTimeout(resultCh, NewCmdTimeOut)
+		if ok {
+			return result, true
+		}
+	}
+}
+
+func RecvWithTimeout[T any](ch <-chan T, timeout time.Duration) (T, bool) {
+	var zero T
+	if timeout <= 0 {
+		v, ok := <-ch
+		if !ok {
+			return zero, false
+		}
+		return v, true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			return zero, false
+		}
+		return v, true
+	case <-timer.C:
+		return zero, false
+	}
+}
+
+func SafeWriteChannel[T any](ch chan<- T, value T) {
+	if ch != nil {
+		select {
+		case ch <- value:
+		default:
+		}
+	}
 }

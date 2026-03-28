@@ -9,13 +9,14 @@ package shardkv
 //
 
 import (
-	"6.5840/labrpc"
+	"crypto/rand"
+	"math/big"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labrpc"
+	"6.5840/shardctrler"
 )
-import "crypto/rand"
-import "math/big"
-import "6.5840/shardctrler"
-import "time"
 
 // which shard is a key in?
 // please use this function,
@@ -27,6 +28,10 @@ func key2shard(key string) int {
 	}
 	shard %= shardctrler.NShards
 	return shard
+}
+
+func Key2shard(key string) int {
+	return key2shard(key)
 }
 
 func nrand() int64 {

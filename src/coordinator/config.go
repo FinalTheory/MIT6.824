@@ -3,6 +3,7 @@ package coordinator
 import (
 	"fmt"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"6.5840/labrpc"
@@ -27,6 +28,10 @@ type config struct {
 	ctrlers     []*shardctrler.ShardCtrler
 	coords      []*Coordinator
 	groups      []*group
+	smClerk     *shardctrler.Clerk
+	kvClerk     *shardkv.Clerk
+	coordClerk  *Clerk
+	claimedKeys map[string]struct{}
 }
 
 func make_config(nservers int, gids ...int) *config {
@@ -41,6 +46,7 @@ func make_config(nservers int, gids ...int) *config {
 		ctrlers:     make([]*shardctrler.ShardCtrler, nservers),
 		coords:      make([]*Coordinator, nservers),
 		groups:      make([]*group, len(gids)),
+		claimedKeys: make(map[string]struct{}),
 	}
 	cfg.net.Reliable(true)
 
@@ -61,11 +67,13 @@ func make_config(nservers int, gids ...int) *config {
 	}
 
 	cfg.startCtrlers()
+	cfg.smClerk = shardctrler.MakeClerk(cfg.makePeerEnds("ctrler-test", cfg.ctrlerNames))
 	cfg.startShards()
-	time.Sleep(500 * time.Millisecond)
 	cfg.joinAllGroups()
+	cfg.kvClerk = cfg.makeShardKVClerk()
+	cfg.waitForShardKVReady()
 	cfg.startCoordinators()
-	time.Sleep(800 * time.Millisecond)
+	cfg.coordClerk = cfg.makeCoordinatorClerk()
 	return cfg
 }
 
@@ -74,13 +82,16 @@ func (cfg *config) cleanup() {
 		co.Kill()
 	}
 	for _, g := range cfg.groups {
-		for _, shard := range g.servers {
-			shard.Kill()
+		for _, kv := range g.servers {
+			kv.Kill()
 		}
 	}
 	for _, ctrler := range cfg.ctrlers {
 		ctrler.Kill()
 	}
+	cfg.coordClerk.Kill()
+	cfg.kvClerk.Kill()
+	cfg.smClerk.Kill()
 	cfg.net.Cleanup()
 }
 
@@ -162,13 +173,11 @@ func (cfg *config) startCoordinators() {
 }
 
 func (cfg *config) joinAllGroups() {
-	ck := shardctrler.MakeClerk(cfg.makePeerEnds("ctrler-join", cfg.ctrlerNames))
-	defer ck.Kill()
 	servers := make(map[int][]string, len(cfg.groups))
 	for _, g := range cfg.groups {
 		servers[g.gid] = append([]string(nil), g.names...)
 	}
-	ck.Join(servers)
+	cfg.smClerk.Join(servers)
 }
 
 func (cfg *config) makeShardKVClerk() *shardkv.Clerk {
@@ -177,4 +186,97 @@ func (cfg *config) makeShardKVClerk() *shardkv.Clerk {
 
 func (cfg *config) makeCoordinatorClerk() *Clerk {
 	return MakeClerk(cfg.makePeerEnds("coord-client", cfg.coordNames))
+}
+
+func (cfg *config) claimKeyInGID(gid int) string {
+	prefixForShard := func(shard int) byte {
+		for ch := byte('a'); ch <= byte('z'); ch++ {
+			if int(ch)%shardctrler.NShards == shard {
+				return ch
+			}
+		}
+		panic("no prefix for shard")
+	}
+	for {
+		config := cfg.smClerk.Query(-1)
+		for shard, group := range config.Shards {
+			if group == gid {
+				prefix := string(prefixForShard(shard))
+				for suffix := 0; ; suffix++ {
+					key := prefix
+					if suffix > 0 {
+						key = fmt.Sprintf("%s%d", prefix, suffix)
+					}
+					if _, ok := cfg.claimedKeys[key]; ok {
+						continue
+					}
+					cfg.claimedKeys[key] = struct{}{}
+					return key
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (cfg *config) waitForShardKVReady() {
+	for _, g := range cfg.groups {
+		key := cfg.claimKeyInGID(g.gid)
+		value := fmt.Sprintf("ready-%d", g.gid)
+		cfg.kvClerk.Put(key, value)
+		if got := cfg.kvClerk.Get(key); got != value {
+			panic("shardkv not ready")
+		}
+	}
+}
+
+func (cfg *config) runTxn(t *testing.T, ck *Clerk, txnID string, ops []TxnOperation, want []string) {
+	done := make(chan []string, 1)
+	go func() { done <- ck.Transaction(txnID, ops) }()
+	select {
+	case got := <-done:
+		if len(got) != len(want) {
+			t.Fatalf("%s returned unexpected length: %v", txnID, got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s result[%d] mismatch: got %q want %q", txnID, i, got[i], want[i])
+			}
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("%s timed out", txnID)
+	}
+}
+
+func callGroupRPC[T any](t *testing.T, cfg *config, gid int, rpcName string, args any, getErr func(*T) shardkv.Err) T {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, g := range cfg.groups {
+			if g.gid != gid {
+				continue
+			}
+			for _, name := range g.names {
+				var reply T
+				if srv := cfg.makeEnd(name); srv.Call(rpcName, args, &reply) && getErr(&reply) != shardkv.ErrWrongLeader {
+					return reply
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no shardkv leader for gid %d", gid)
+	var zero T
+	return zero
+}
+
+func (cfg *config) callGroupPrepare(t *testing.T, gid int, args *shardkv.PrepareArgs) shardkv.PrepareReply {
+	return callGroupRPC(t, cfg, gid, "ShardKV.Prepare", args, func(reply *shardkv.PrepareReply) shardkv.Err { return reply.Err })
+}
+
+func (cfg *config) callGroupCommit(t *testing.T, gid int, args *shardkv.CommitArgs) shardkv.CommitReply {
+	return callGroupRPC(t, cfg, gid, "ShardKV.Commit", args, func(reply *shardkv.CommitReply) shardkv.Err { return reply.Err })
+}
+
+func (cfg *config) callGroupAbort(t *testing.T, gid int, args *shardkv.AbortArgs) shardkv.AbortReply {
+	return callGroupRPC(t, cfg, gid, "ShardKV.Abort", args, func(reply *shardkv.AbortReply) shardkv.Err { return reply.Err })
 }

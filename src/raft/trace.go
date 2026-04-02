@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Trace = true
+const Trace = false
 
 var gMutex sync.Mutex
 var gFile *os.File = nil

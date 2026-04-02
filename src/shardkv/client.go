@@ -49,6 +49,10 @@ type Clerk struct {
 	seqCounter atomic.Int32
 }
 
+func (ck *Clerk) Kill() {
+	ck.sm.Kill()
+}
+
 // the tester calls MakeClerk.
 //
 // ctrlers[] is needed to call shardctrler.MakeClerk().

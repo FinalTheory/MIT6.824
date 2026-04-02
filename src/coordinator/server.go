@@ -50,6 +50,14 @@ type Coordinator struct {
 	recoveryDriverKilled chan bool
 }
 
+func (co *Coordinator) traceTxn(name string, txnID string, args map[string]any) {
+	if args == nil {
+		args = make(map[string]any)
+	}
+	args["txn_id"] = txnID
+	raft.TraceInstant(name, co.me, 0, time.Now().UnixMicro(), args)
+}
+
 func (co *Coordinator) tryEnterTxn(txnID string) bool {
 	co.inflightMu.Lock()
 	defer co.inflightMu.Unlock()
@@ -66,35 +74,46 @@ func (co *Coordinator) leaveTxn(txnID string) {
 	delete(co.inflightTxns, txnID)
 }
 
-func (co *Coordinator) tryEnterExecutor(txnID string) bool {
+func executorKey(txnID string, status TxnStatus) string {
+	return fmt.Sprintf("%s:%s", txnID, status)
+}
+
+func (co *Coordinator) tryEnterExecutor(txnID string, status TxnStatus) bool {
 	co.activeMu.Lock()
 	defer co.activeMu.Unlock()
-	if _, ok := co.activeExecutors[txnID]; ok {
+	key := executorKey(txnID, status)
+	if _, ok := co.activeExecutors[key]; ok {
 		return false
 	}
-	co.activeExecutors[txnID] = struct{}{}
+	co.activeExecutors[key] = struct{}{}
 	return true
 }
 
-func (co *Coordinator) leaveExecutor(txnID string) {
+func (co *Coordinator) leaveExecutor(txnID string, status TxnStatus) {
 	co.activeMu.Lock()
 	defer co.activeMu.Unlock()
-	delete(co.activeExecutors, txnID)
+	delete(co.activeExecutors, executorKey(txnID, status))
 }
 
 // this is a blocking function call
 // it blocks until the txn is committed/aborted, or the server node crashes
 func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
-	raft.DPrintf("[coordinator %d] Transaction start txn=%s ops=%d", co.me, args.TxnId, len(args.Operations))
+	co.traceTxn("TxnStart", args.TxnId, map[string]any{
+		"ops": len(args.Operations),
+	})
 	// 1. Leader check
 	if _, isLeader := co.rf.GetState(); !isLeader {
-		raft.DPrintf("[coordinator %d] Transaction reject txn=%s: not leader", co.me, args.TxnId)
+		co.traceTxn("TxnReject", args.TxnId, map[string]any{
+			"reason": "not_leader",
+		})
 		reply.Err = shardkv.ErrWrongLeader
 		return
 	}
 	// 2. Avoid concurrent call on same Txn
 	if !co.tryEnterTxn(args.TxnId) {
-		raft.DPrintf("[coordinator %d] Transaction reject txn=%s: in flight", co.me, args.TxnId)
+		co.traceTxn("TxnReject", args.TxnId, map[string]any{
+			"reason": "in_flight",
+		})
 		reply.Err = shardkv.ErrTxnInFlight
 		return
 	}
@@ -152,10 +171,14 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 		reply.Err = shardkv.ErrWrongLeader
 		return
 	}
-	raft.DPrintf("[coordinator %d] Transaction wait result txn=%s status=%s", co.me, args.TxnId, status)
+	co.traceTxn("TxnWait", args.TxnId, map[string]any{
+		"status": status,
+	})
 	reply.Err = <-state.ResultCh
 	reply.Values = state.Values
-	raft.DPrintf("[coordinator %d] Transaction done txn=%s reply=%s", co.me, args.TxnId, reply.Err)
+	co.traceTxn("TxnDone", args.TxnId, map[string]any{
+		"err": reply.Err,
+	})
 }
 
 func (co *Coordinator) stateMachineExecutor() {
@@ -165,7 +188,12 @@ func (co *Coordinator) stateMachineExecutor() {
 	for !co.killed() {
 		select {
 		case cmd := <-co.applyCh:
-			raft.DPrintf("[coordinator %d] applyCh recv valid=%v index=%d", co.me, cmd.CommandValid, cmd.CommandIndex)
+			raft.TraceInstant("CoordApplyCh", co.me, 0, time.Now().UnixMicro(), map[string]any{
+				"command_valid":  cmd.CommandValid,
+				"snapshot_valid": cmd.SnapshotValid,
+				"index":          cmd.CommandIndex,
+				"snapshot_index": cmd.SnapshotIndex,
+			})
 			if cmd.SnapshotValid && cmd.SnapshotIndex <= co.lastAppliedIndex {
 				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, co.lastAppliedIndex))
 			}
@@ -181,7 +209,10 @@ func (co *Coordinator) stateMachineExecutor() {
 				panic("unexpected")
 			}
 			op := cmd.Command.(TxnCmd)
-			raft.DPrintf("[coordinator %d] stateMachineExecutor applying txn=%s status=%s index=%d", co.me, op.TxnId, op.Status, cmd.CommandIndex)
+			co.traceTxn("CoordApply", op.TxnId, map[string]any{
+				"status": op.Status,
+				"index":  cmd.CommandIndex,
+			})
 			co.applyOperation(op)
 			co.lastAppliedIndex = cmd.CommandIndex
 			if co.persister.RaftStateSize() >= CoordinatorRaftMaxSize {
@@ -287,15 +318,20 @@ func (co *Coordinator) broadcastToGroups(cmd TxnCmd, state *TxnState, rpcFunc gr
 }
 
 func (co *Coordinator) executePrepare(cmd TxnCmd, state *TxnState) {
-	if !co.tryEnterExecutor(cmd.TxnId) {
+	if !co.tryEnterExecutor(cmd.TxnId, TxnStatusPrepare) {
 		return
 	}
-	defer co.leaveExecutor(cmd.TxnId)
+	defer co.leaveExecutor(cmd.TxnId, TxnStatusPrepare)
 	if _, isLeader := co.rf.GetState(); !isLeader {
-		raft.DPrintf("[coordinator %d] executePrepare skip txn=%s: not leader", co.me, cmd.TxnId)
+		co.traceTxn("TxnPrepareSkip", cmd.TxnId, map[string]any{
+			"reason": "not_leader",
+		})
 		return
 	}
-	raft.DPrintf("[coordinator %d] executePrepare txn=%s participants=%d config=%d", co.me, cmd.TxnId, len(state.GroupOps), state.Config.Num)
+	co.traceTxn("TxnPrepareDrive", cmd.TxnId, map[string]any{
+		"groups": len(state.GroupOps),
+		"config": state.Config.Num,
+	})
 	if co.broadcastToGroups(cmd, state, co.sendPrepareRPC, nil) {
 		co.moveToStatus(cmd.TxnId, TxnStatusCommit)
 	} else {
@@ -304,14 +340,21 @@ func (co *Coordinator) executePrepare(cmd TxnCmd, state *TxnState) {
 }
 
 func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc groupRPCFunc, finalStatus TxnStatus, valuesOut []string) {
-	if !co.tryEnterExecutor(cmd.TxnId) {
+	if !co.tryEnterExecutor(cmd.TxnId, cmd.Status) {
 		return
 	}
-	defer co.leaveExecutor(cmd.TxnId)
-	raft.DPrintf("[coordinator %d] ensure final action %s txn=%s participants=%d config=%d", co.me, cmd.Status, cmd.TxnId, len(state.GroupOps), state.Config.Num)
+	defer co.leaveExecutor(cmd.TxnId, cmd.Status)
+	co.traceTxn("TxnFinalDrive", cmd.TxnId, map[string]any{
+		"status": cmd.Status,
+		"groups": len(state.GroupOps),
+		"config": state.Config.Num,
+	})
 	for {
 		if _, isLeader := co.rf.GetState(); !isLeader {
-			raft.DPrintf("[coordinator %d] %s skip txn=%s: not leader", co.me, cmd.Status, cmd.TxnId)
+			co.traceTxn("TxnFinalSkip", cmd.TxnId, map[string]any{
+				"status": cmd.Status,
+				"reason": "not_leader",
+			})
 			return
 		}
 		if co.broadcastToGroups(cmd, state, rpcFunc, valuesOut) {
@@ -324,19 +367,26 @@ func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc g
 			shardkv.PersistCommand(co.rf, nextCmd, nextCmd.ExecutedCh, func() {})
 			return
 		} else {
-			raft.DPrintf("[coordinator %d] ensure final action %s txn=%s: send failed", co.me, cmd.Status, cmd.TxnId)
+			co.traceTxn("TxnFinalRetry", cmd.TxnId, map[string]any{
+				"status": cmd.Status,
+			})
 		}
 	}
 }
 
 func (co *Coordinator) applyOperation(cmd TxnCmd) {
-	raft.DPrintf("[coordinator %d] applyOperation txn=%s status=%s", co.me, cmd.TxnId, cmd.Status)
+	co.traceTxn("TxnStateApply", cmd.TxnId, map[string]any{
+		"status": cmd.Status,
+	})
 	co.mutex.Lock()
 	defer co.mutex.Unlock()
 	state, ok := co.stateTable[cmd.TxnId]
 	// to avoid the state machine moving backwards
 	if ok && statusOrder(cmd.Status) <= statusOrder(state.Status) {
-		raft.DPrintf("[coordinator %d] applyOperation ignore txn=%s incoming=%s current=%s", co.me, cmd.TxnId, cmd.Status, state.Status)
+		co.traceTxn("TxnStateIgnore", cmd.TxnId, map[string]any{
+			"incoming": cmd.Status,
+			"current":  state.Status,
+		})
 		return
 	}
 	if ok && state.ResultCh == nil {
@@ -344,7 +394,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	}
 	switch cmd.Status {
 	case TxnStatusPrepare:
-		raft.DPrintf("[coordinator %d] applyOperation prepare txn=%s", co.me, cmd.TxnId)
+		co.traceTxn("TxnPrepareApplied", cmd.TxnId, nil)
 		state := TxnState{
 			Status:         TxnStatusPrepare,
 			Config:         cmd.Config,
@@ -357,7 +407,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 		co.stateTable[cmd.TxnId] = &state
 		go co.executePrepare(cmd, &state)
 	case TxnStatusCommit:
-		raft.DPrintf("[coordinator %d] applyOperation commit txn=%s", co.me, cmd.TxnId)
+		co.traceTxn("TxnCommitApplied", cmd.TxnId, nil)
 		state.Status = TxnStatusCommit
 		go co.executeFinalAction(
 			cmd,
@@ -367,7 +417,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 			make([]string, state.OpsCount),
 		)
 	case TxnStatusAbort:
-		raft.DPrintf("[coordinator %d] applyOperation abort txn=%s", co.me, cmd.TxnId)
+		co.traceTxn("TxnAbortApplied", cmd.TxnId, nil)
 		state.Status = TxnStatusAbort
 		go co.executeFinalAction(
 			cmd,
@@ -379,11 +429,13 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	case TxnStatusCommitted:
 		state.Status = TxnStatusCommitted
 		state.Values = cmd.Values
-		raft.DPrintf("[coordinator %d] applyOperation committed txn=%s", co.me, cmd.TxnId)
+		co.traceTxn("TxnCommitted", cmd.TxnId, map[string]any{
+			"values": len(cmd.Values),
+		})
 		shardkv.SafeWriteChannel(state.ResultCh, shardkv.OK)
 	case TxnStatusAborted:
 		state.Status = TxnStatusAborted
-		raft.DPrintf("[coordinator %d] applyOperation aborted txn=%s", co.me, cmd.TxnId)
+		co.traceTxn("TxnAborted", cmd.TxnId, nil)
 		shardkv.SafeWriteChannel(state.ResultCh, shardkv.ErrTxnAborted)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -535,6 +537,186 @@ func TestTxnTriangleConflict(t *testing.T) {
 		commit(round, rightHolder, []string{rightWin})
 		check(round, leftKey, cfg.kvClerk.Get(leftKey), leftWin)
 		check(round, rightKey, cfg.kvClerk.Get(rightKey), rightWin)
+	}
+}
+
+type randomTxnOptions struct {
+	unreliable bool
+	crash      bool
+	reconfig   bool
+	rounds     int
+	workers    int
+	opsPerTxn  int
+}
+
+func runRandomTxnTest(t *testing.T, opts randomTxnOptions) {
+	resetEvents()
+	gids := []int{100, 101, 102, 103, 104}
+	cfg := make_config(3, gids...)
+	defer cfg.cleanup()
+	cfg.net.Reliable(!opts.unreliable)
+
+	workerKeys := make([][]string, opts.workers)
+	expected := make([][]string, opts.workers)
+	var checkMu sync.RWMutex
+	for w := 0; w < opts.workers; w++ {
+		workerKeys[w] = make([]string, 0, len(gids))
+		for _, gid := range gids {
+			workerKeys[w] = append(workerKeys[w], cfg.claimKeyInGID(gid))
+		}
+		expected[w] = make([]string, len(workerKeys[w]))
+		for _, key := range workerKeys[w] {
+			cfg.kvClerk.Put(key, "")
+		}
+	}
+	checkTxnResult := func() {
+		checkMu.Lock()
+		defer checkMu.Unlock()
+		for w := range workerKeys {
+			for i, key := range workerKeys[w] {
+				if got := cfg.kvClerk.Get(key); got != expected[w][i] {
+					t.Fatalf("worker %d key %s mismatch: got %q want %q", w, key, got, expected[w][i])
+				}
+			}
+		}
+	}
+
+	var done atomic.Int32
+	var successes atomic.Int32
+	var aborts atomic.Int32
+	finishCh := make(chan bool, opts.workers)
+	for worker := 0; worker < opts.workers; worker++ {
+		go func(worker int) {
+			defer func() { finishCh <- true }()
+			ck := cfg.makeCoordinatorClerk()
+			defer ck.Kill()
+			r := rand.New(rand.NewSource(int64(worker + 1)))
+			seq := 0
+			for done.Load() == 0 {
+				checkMu.RLock()
+				ops := make([]TxnOperation, 0, opts.opsPerTxn)
+				next := append([]string(nil), expected[worker]...)
+				for i := 0; i < opts.opsPerTxn; i++ {
+					keyIdx := r.Intn(len(workerKeys[worker]))
+					key := workerKeys[worker][keyIdx]
+					switch r.Intn(3) {
+					case 0:
+						ops = append(ops, TxnOperation{Key: key, Op: kvraft.GetOp})
+					case 1:
+						value := "put-" + strconv.Itoa(worker) + "-" + strconv.Itoa(seq) + "-" + strconv.Itoa(i)
+						ops = append(ops, TxnOperation{Key: key, Value: value, Op: kvraft.PutOp})
+						next[keyIdx] = value
+					default:
+						value := "+app-" + strconv.Itoa(worker) + "-" + strconv.Itoa(seq) + "-" + strconv.Itoa(i)
+						ops = append(ops, TxnOperation{Key: key, Value: value, Op: kvraft.AppendOp})
+						next[keyIdx] += value
+					}
+				}
+				if ck.Transaction("txn-random-"+strconv.Itoa(worker)+"-"+strconv.Itoa(seq), ops) != nil {
+					copy(expected[worker], next)
+					successes.Add(1)
+				} else {
+					aborts.Add(1)
+				}
+				checkMu.RUnlock()
+				if seq%10 == 9 {
+					checkTxnResult()
+				}
+				seq++
+			}
+		}(worker)
+	}
+
+	r := rand.New(rand.NewSource(99))
+	joined := map[int]bool{}
+	groupServers := map[int][]string{}
+	joinedCount := 0
+	for _, g := range cfg.groups {
+		joined[g.gid] = true
+		groupServers[g.gid] = append([]string(nil), g.names...)
+		joinedCount++
+	}
+	restarts, reconfigs := 0, 0
+	for round := 0; round < opts.rounds; round++ {
+		if round > opts.rounds/2 {
+			cfg.net.LongReordering(opts.unreliable)
+		}
+		if opts.reconfig {
+			gid := gids[r.Intn(len(gids))]
+			if joined[gid] && joinedCount > 1 {
+				cfg.smClerk.Leave([]int{gid})
+				joined[gid] = false
+				joinedCount--
+			} else if !joined[gid] {
+				cfg.smClerk.Join(map[int][]string{gid: groupServers[gid]})
+				joined[gid] = true
+				joinedCount++
+			}
+			reconfigs++
+		}
+		if opts.crash {
+			i := r.Intn(cfg.nservers)
+			cfg.shutdownCoordinator(i)
+			time.Sleep(time.Duration(50+r.Intn(100)) * time.Millisecond)
+			cfg.startCoordinator(i)
+			restarts++
+		}
+		time.Sleep(time.Duration(100+r.Intn(150)) * time.Millisecond)
+	}
+
+	done.Store(1)
+	if opts.unreliable {
+		cfg.net.Reliable(true)
+		cfg.net.LongReordering(false)
+	}
+	for worker := 0; worker < opts.workers; worker++ {
+		<-finishCh
+	}
+	checkTxnResult()
+	t.Logf("random txn commits=%d aborts=%d restarts=%d reconfigs=%d unreliable=%v crash=%v reconfig=%v snapshot=%d",
+		successes.Load(), aborts.Load(), restarts, reconfigs, opts.unreliable, opts.crash, opts.reconfig, eventCount(EventSnapshotSave))
+}
+
+func TestRandomTxnStable(t *testing.T) {
+	runRandomTxnTest(t, randomTxnOptions{rounds: 20, workers: 3, opsPerTxn: 5})
+}
+
+func TestRandomTxnUnreliable(t *testing.T) {
+	runRandomTxnTest(t, randomTxnOptions{unreliable: true, rounds: 50, workers: 5, opsPerTxn: 5})
+}
+
+func TestRandomTxnCrash(t *testing.T) {
+	runRandomTxnTest(t, randomTxnOptions{crash: true, rounds: 50, workers: 5, opsPerTxn: 5})
+}
+
+func TestRandomTxnReconfig(t *testing.T) {
+	runRandomTxnTest(t, randomTxnOptions{reconfig: true, rounds: 50, workers: 5, opsPerTxn: 6})
+}
+
+func TestRandomTxnChaos(t *testing.T) {
+	runRandomTxnTest(t, randomTxnOptions{
+		unreliable: true,
+		crash:      true,
+		reconfig:   true,
+		rounds:     50,
+		workers:    5,
+		opsPerTxn:  6,
+	})
+	if eventCount(EventTxnRejectNotLeader) == 0 {
+		t.Fatalf("expected %s", EventTxnRejectNotLeader)
+	}
+	rpcFailureHits := eventCount(EventPrepareFailed) +
+		eventCount(EventFinalActionRetry, TxnStatusCommit) +
+		eventCount(EventFinalActionRetry, TxnStatusAbort)
+	if rpcFailureHits == 0 {
+		t.Fatalf("expected prepare/commit/abort disturbance path")
+	}
+	if eventCount(EventSnapshotSave) == 0 || eventCount(EventSnapshotLoad) == 0 {
+		t.Fatalf("expected snapshot save/load, got save=%d load=%d", eventCount(EventSnapshotSave), eventCount(EventSnapshotLoad))
+	}
+	recoveryHits := eventCount(EventRecoveryDrivePrepare) + eventCount(EventRecoveryDriveCommit) + eventCount(EventRecoveryDriveAbort)
+	if recoveryHits == 0 {
+		t.Fatalf("expected recovery driver activity")
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 	"6.5840/shardkv"
 )
 
-const CoordinatorRaftMaxSize = 1024
+const CoordinatorRaftMaxSize = 8 * 1024
 
 type Coordinator struct {
 	mu        sync.Mutex
@@ -98,12 +98,13 @@ func (co *Coordinator) leaveExecutor(txnID string, status TxnStatus) {
 // this is a blocking function call
 // it blocks until the txn is committed/aborted, or the server node crashes
 func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
-	co.traceTxn("TxnStart", args.TxnId, map[string]any{
+	co.traceTxn(TraceTxnStart, args.TxnId, map[string]any{
 		"ops": len(args.Operations),
 	})
 	// 1. Leader check
 	if _, isLeader := co.rf.GetState(); !isLeader {
-		co.traceTxn("TxnReject", args.TxnId, map[string]any{
+		hitEvent(EventTxnRejectNotLeader)
+		co.traceTxn(EventTxnRejectNotLeader, args.TxnId, map[string]any{
 			"reason": "not_leader",
 		})
 		reply.Err = shardkv.ErrWrongLeader
@@ -111,7 +112,7 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 	}
 	// 2. Avoid concurrent call on same Txn
 	if !co.tryEnterTxn(args.TxnId) {
-		co.traceTxn("TxnReject", args.TxnId, map[string]any{
+		co.traceTxn(TraceTxnRejectInFlight, args.TxnId, map[string]any{
 			"reason": "in_flight",
 		})
 		reply.Err = shardkv.ErrTxnInFlight
@@ -171,12 +172,12 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 		reply.Err = shardkv.ErrWrongLeader
 		return
 	}
-	co.traceTxn("TxnWait", args.TxnId, map[string]any{
+	co.traceTxn(TraceTxnWait, args.TxnId, map[string]any{
 		"status": status,
 	})
 	reply.Err = <-state.ResultCh
 	reply.Values = state.Values
-	co.traceTxn("TxnDone", args.TxnId, map[string]any{
+	co.traceTxn(TraceTxnDone, args.TxnId, map[string]any{
 		"err": reply.Err,
 	})
 }
@@ -209,7 +210,7 @@ func (co *Coordinator) stateMachineExecutor() {
 				panic("unexpected")
 			}
 			op := cmd.Command.(TxnCmd)
-			co.traceTxn("CoordApply", op.TxnId, map[string]any{
+			co.traceTxn(TraceTxnCoordApply, op.TxnId, map[string]any{
 				"status": op.Status,
 				"index":  cmd.CommandIndex,
 			})
@@ -323,18 +324,20 @@ func (co *Coordinator) executePrepare(cmd TxnCmd, state *TxnState) {
 	}
 	defer co.leaveExecutor(cmd.TxnId, TxnStatusPrepare)
 	if _, isLeader := co.rf.GetState(); !isLeader {
-		co.traceTxn("TxnPrepareSkip", cmd.TxnId, map[string]any{
+		hitEvent(EventPrepareLostLeader)
+		co.traceTxn(EventPrepareLostLeader, cmd.TxnId, map[string]any{
 			"reason": "not_leader",
 		})
 		return
 	}
-	co.traceTxn("TxnPrepareDrive", cmd.TxnId, map[string]any{
+	co.traceTxn(TraceTxnPrepare, cmd.TxnId, map[string]any{
 		"groups": len(state.GroupOps),
 		"config": state.Config.Num,
 	})
 	if co.broadcastToGroups(cmd, state, co.sendPrepareRPC, nil) {
 		co.moveToStatus(cmd.TxnId, TxnStatusCommit)
 	} else {
+		hitEvent(EventPrepareFailed)
 		co.moveToStatus(cmd.TxnId, TxnStatusAbort)
 	}
 }
@@ -344,14 +347,15 @@ func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc g
 		return
 	}
 	defer co.leaveExecutor(cmd.TxnId, cmd.Status)
-	co.traceTxn("TxnFinalDrive", cmd.TxnId, map[string]any{
+	co.traceTxn(TraceTxnFinalAction, cmd.TxnId, map[string]any{
 		"status": cmd.Status,
 		"groups": len(state.GroupOps),
 		"config": state.Config.Num,
 	})
 	for {
 		if _, isLeader := co.rf.GetState(); !isLeader {
-			co.traceTxn("TxnFinalSkip", cmd.TxnId, map[string]any{
+			hitEvent(EventFinalActionLostLeader, cmd.Status)
+			co.traceTxn(eventKey(EventFinalActionLostLeader, cmd.Status), cmd.TxnId, map[string]any{
 				"status": cmd.Status,
 				"reason": "not_leader",
 			})
@@ -367,7 +371,8 @@ func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc g
 			shardkv.PersistCommand(co.rf, nextCmd, nextCmd.ExecutedCh, func() {})
 			return
 		} else {
-			co.traceTxn("TxnFinalRetry", cmd.TxnId, map[string]any{
+			hitEvent(EventFinalActionRetry, cmd.Status)
+			co.traceTxn(eventKey(EventFinalActionRetry, cmd.Status), cmd.TxnId, map[string]any{
 				"status": cmd.Status,
 			})
 		}
@@ -375,7 +380,7 @@ func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc g
 }
 
 func (co *Coordinator) applyOperation(cmd TxnCmd) {
-	co.traceTxn("TxnStateApply", cmd.TxnId, map[string]any{
+	co.traceTxn(TraceTxnStateApply, cmd.TxnId, map[string]any{
 		"status": cmd.Status,
 	})
 	co.mutex.Lock()
@@ -383,7 +388,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	state, ok := co.stateTable[cmd.TxnId]
 	// to avoid the state machine moving backwards
 	if ok && statusOrder(cmd.Status) <= statusOrder(state.Status) {
-		co.traceTxn("TxnStateIgnore", cmd.TxnId, map[string]any{
+		co.traceTxn(TraceTxnStateIgnore, cmd.TxnId, map[string]any{
 			"incoming": cmd.Status,
 			"current":  state.Status,
 		})
@@ -394,7 +399,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	}
 	switch cmd.Status {
 	case TxnStatusPrepare:
-		co.traceTxn("TxnPrepareApplied", cmd.TxnId, nil)
+		co.traceTxn(TraceTxnPrepareApplied, cmd.TxnId, nil)
 		state := TxnState{
 			Status:         TxnStatusPrepare,
 			Config:         cmd.Config,
@@ -407,7 +412,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 		co.stateTable[cmd.TxnId] = &state
 		go co.executePrepare(cmd, &state)
 	case TxnStatusCommit:
-		co.traceTxn("TxnCommitApplied", cmd.TxnId, nil)
+		co.traceTxn(TraceTxnCommitApplied, cmd.TxnId, nil)
 		state.Status = TxnStatusCommit
 		go co.executeFinalAction(
 			cmd,
@@ -417,7 +422,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 			make([]string, state.OpsCount),
 		)
 	case TxnStatusAbort:
-		co.traceTxn("TxnAbortApplied", cmd.TxnId, nil)
+		co.traceTxn(TraceTxnAbortApplied, cmd.TxnId, nil)
 		state.Status = TxnStatusAbort
 		go co.executeFinalAction(
 			cmd,
@@ -429,13 +434,13 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	case TxnStatusCommitted:
 		state.Status = TxnStatusCommitted
 		state.Values = cmd.Values
-		co.traceTxn("TxnCommitted", cmd.TxnId, map[string]any{
+		co.traceTxn(TraceTxnCommitted, cmd.TxnId, map[string]any{
 			"values": len(cmd.Values),
 		})
 		shardkv.SafeWriteChannel(state.ResultCh, shardkv.OK)
 	case TxnStatusAborted:
 		state.Status = TxnStatusAborted
-		co.traceTxn("TxnAborted", cmd.TxnId, nil)
+		co.traceTxn(TraceTxnAborted, cmd.TxnId, nil)
 		shardkv.SafeWriteChannel(state.ResultCh, shardkv.ErrTxnAborted)
 	}
 }
@@ -447,12 +452,14 @@ func (co *Coordinator) recoveryDriver() {
 			for txnID, state := range co.stateTable {
 				switch state.Status {
 				case TxnStatusPrepare:
+					hitEvent(EventRecoveryDrivePrepare)
 					go co.executePrepare(TxnCmd{
 						TxnId:  txnID,
 						Status: TxnStatusPrepare,
 						Config: state.Config,
 					}, state)
 				case TxnStatusCommit:
+					hitEvent(EventRecoveryDriveCommit)
 					go co.executeFinalAction(
 						TxnCmd{
 							TxnId:  txnID,
@@ -465,6 +472,7 @@ func (co *Coordinator) recoveryDriver() {
 						make([]string, state.OpsCount),
 					)
 				case TxnStatusAbort:
+					hitEvent(EventRecoveryDriveAbort)
 					go co.executeFinalAction(
 						TxnCmd{
 							TxnId:  txnID,
@@ -496,6 +504,7 @@ func (co *Coordinator) configPullerThread() {
 }
 
 func (co *Coordinator) doSnapshot(index int) {
+	hitEvent(EventSnapshotSave)
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
 	if err := e.Encode(co.lastAppliedIndex); err != nil {
@@ -513,6 +522,7 @@ func (co *Coordinator) reloadFromSnapshot(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
+	hitEvent(EventSnapshotLoad)
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var lastAppliedIndex int

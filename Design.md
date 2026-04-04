@@ -190,9 +190,19 @@
 
 ### 2. 测试覆盖
 
+当前已经补上的测试大致分为三层：
+
+- 基础 correctness：基本跨 group 成功路径、幂等 retry、空事务 / 单 participant / 单 key 单操作边界、同一 `txnID` 重复调用时以第一次结果为准
+- 定向协议语义：冲突 abort、同 key 多次操作顺序与返回值、`Abort` 先到后的 tombstone、participant commit 幂等、triangle conflict、`Prepare` 挡住 reconfig、部分 participant 已 prepared 时的全局 abort
+- 随机扰动回归：统一的随机事务框架支持 `unreliable`、`long reordering`、coordinator crash/restart 与动态 reconfig 的组合开关；worker 间不共享 key，因此可以持续做强最终值检查。随机测试还额外接入了一套轻量事件 recorder，用来确认诸如 not-leader、group RPC failure、recovery driver 与 snapshot save/load 等关键路径确实被触发
+
+随机测试目前保持一个刻意的限制：
+
+- 不让不同 worker 共享 key。这样可以把复杂度集中在网络、coordinator 恢复与 reconfig 扰动本身，同时保留强最终状态校验；随机冲突语义已经由前面的定向 case 单独覆盖
+
 #### 可以主要依赖随机 crash / unreliable network 覆盖的场景
 
-以下测试运行期间要不停进行reconfig
+以下测试运行期间要不停进行reconfig，并且最终需要打点确认逻辑分支真的有走到。
 
 - coordinator 在事务中间态附近 crash/restart，随后由 recovery driver 继续推进到终态
 - snapshot 真正触发后的恢复路径测试：coordinator / participant 在快照后重启，事务状态、锁状态与最终 `Values` 仍一致
@@ -201,7 +211,6 @@
 - unreliable network 叠加 coordinator leader 切换：旧 leader 只完成部分 RPC 发送后失效，新 leader 通过 recovery driver 继续推进未决事务
 - client 到 coordinator 的事务 reply 丢失测试：客户端以同一 `txnID` 重试 `Transaction` 时，最终返回结果保持一致
 - coordinator leader 在事务中途切换，但客户端只通过同一 `txnID` 做无感重试，最终仍返回一致结果
-- 多轮连续事务后的回归检查：连续执行多笔小事务后，用普通 `kvClerk` 对关键 key 做最终状态核对，检查锁泄漏与残留事务状态
 
 #### 单独保留的高层语义测试
 

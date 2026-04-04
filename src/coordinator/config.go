@@ -27,6 +27,9 @@ type config struct {
 	coordNames  []string
 	ctrlers     []*shardctrler.ShardCtrler
 	coords      []*Coordinator
+	coordSaved  []*raft.Persister
+	coordEnds   [][]string
+	coordMEnds  [][]string
 	groups      []*group
 	smClerk     *shardctrler.Clerk
 	kvClerk     *shardkv.Clerk
@@ -45,6 +48,9 @@ func make_config(nservers int, gids ...int) *config {
 		coordNames:  make([]string, nservers),
 		ctrlers:     make([]*shardctrler.ShardCtrler, nservers),
 		coords:      make([]*Coordinator, nservers),
+		coordSaved:  make([]*raft.Persister, nservers),
+		coordEnds:   make([][]string, nservers),
+		coordMEnds:  make([][]string, nservers),
 		groups:      make([]*group, len(gids)),
 		claimedKeys: make(map[string]struct{}),
 	}
@@ -115,6 +121,19 @@ func (cfg *config) makePeerEnds(prefix string, serverNames []string) []*labrpc.C
 	return ends
 }
 
+func (cfg *config) makeTrackedPeerEnds(prefix string, serverNames []string) ([]*labrpc.ClientEnd, []string) {
+	ends := make([]*labrpc.ClientEnd, len(serverNames))
+	names := make([]string, len(serverNames))
+	for i, serverName := range serverNames {
+		endname := cfg.endName(prefix)
+		names[i] = endname
+		ends[i] = cfg.net.MakeEnd(endname)
+		cfg.net.Connect(endname, serverName)
+		cfg.net.Enable(endname, true)
+	}
+	return ends, names
+}
+
 func (cfg *config) makeEnd(servername string) *labrpc.ClientEnd {
 	return cfg.makeConnectedEnd("dynamic", servername)
 }
@@ -157,18 +176,45 @@ func (cfg *config) startShards() {
 
 func (cfg *config) startCoordinators() {
 	for i := 0; i < cfg.nservers; i++ {
-		cfg.coords[i] = StartServer(
-			cfg.makePeerEnds(fmt.Sprintf("coord-peer-%d", i), cfg.coordNames),
-			i,
-			raft.MakePersister(),
-			cfg.makePeerEnds(fmt.Sprintf("coord-ctrler-%d", i), cfg.ctrlerNames),
-			cfg.makeEnd,
-		)
+		cfg.startCoordinator(i)
+	}
+}
 
-		srv := labrpc.MakeServer()
-		srv.AddService(labrpc.MakeService(cfg.coords[i]))
-		srv.AddService(labrpc.MakeService(cfg.coords[i].rf))
-		cfg.net.AddServer(cfg.coordNames[i], srv)
+func (cfg *config) startCoordinator(i int) {
+	if cfg.coordSaved[i] == nil {
+		cfg.coordSaved[i] = raft.MakePersister()
+	}
+	peerEnds, peerNames := cfg.makeTrackedPeerEnds(fmt.Sprintf("coord-peer-%d", i), cfg.coordNames)
+	ctrlerEnds, ctrlerNames := cfg.makeTrackedPeerEnds(fmt.Sprintf("coord-ctrler-%d", i), cfg.ctrlerNames)
+	cfg.coordEnds[i] = peerNames
+	cfg.coordMEnds[i] = ctrlerNames
+	cfg.coords[i] = StartServer(
+		peerEnds,
+		i,
+		cfg.coordSaved[i],
+		ctrlerEnds,
+		cfg.makeEnd,
+	)
+	srv := labrpc.MakeServer()
+	srv.AddService(labrpc.MakeService(cfg.coords[i]))
+	srv.AddService(labrpc.MakeService(cfg.coords[i].rf))
+	cfg.net.AddServer(cfg.coordNames[i], srv)
+}
+
+func (cfg *config) shutdownCoordinator(i int) {
+	for _, endname := range cfg.coordEnds[i] {
+		cfg.net.Enable(endname, false)
+	}
+	for _, endname := range cfg.coordMEnds[i] {
+		cfg.net.Enable(endname, false)
+	}
+	cfg.net.DeleteServer(cfg.coordNames[i])
+	if cfg.coordSaved[i] != nil {
+		cfg.coordSaved[i] = cfg.coordSaved[i].Copy()
+	}
+	if co := cfg.coords[i]; co != nil {
+		co.Kill()
+		cfg.coords[i] = nil
 	}
 }
 

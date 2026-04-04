@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"6.5840/labrpc"
+	"6.5840/shardctrler"
 	"6.5840/shardkv"
 )
 
@@ -41,13 +42,18 @@ func (ck *Clerk) killed() bool {
 	return ck.dead.Load()
 }
 
-func (ck *Clerk) Transaction(txn_id string, ops []TxnOperation) []string {
+func (ck *Clerk) Transaction(txnId string, ops []TxnOperation) []string {
+	return ck.TransactionWithConfig(txnId, ops, shardctrler.Config{})
+}
+
+func (ck *Clerk) TransactionWithConfig(txnId string, ops []TxnOperation, config shardctrler.Config) []string {
 	if len(ops) == 0 {
 		return make([]string, 0)
 	}
 	args := &TxnArgs{}
-	args.TxnId = txn_id
+	args.TxnId = txnId
 	args.Operations = ops
+	args.Config = config
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {

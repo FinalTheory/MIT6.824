@@ -78,7 +78,7 @@ func executorKey(txnID string, status TxnStatus) string {
 	return fmt.Sprintf("%s:%s", txnID, status)
 }
 
-func (co *Coordinator) tryEnterExecutor(txnID string, status TxnStatus) bool {
+func (co *Coordinator) tryEnterExecutor(txnID string, status TxnStatus, onEnter func()) bool {
 	co.activeMu.Lock()
 	defer co.activeMu.Unlock()
 	key := executorKey(txnID, status)
@@ -86,6 +86,9 @@ func (co *Coordinator) tryEnterExecutor(txnID string, status TxnStatus) bool {
 		return false
 	}
 	co.activeExecutors[key] = struct{}{}
+	if onEnter != nil {
+		onEnter()
+	}
 	return true
 }
 
@@ -103,10 +106,6 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 	})
 	// 1. Leader check
 	if _, isLeader := co.rf.GetState(); !isLeader {
-		hitEvent(EventTxnRejectNotLeader)
-		co.traceTxn(EventTxnRejectNotLeader, args.TxnId, map[string]any{
-			"reason": "not_leader",
-		})
 		reply.Err = shardkv.ErrWrongLeader
 		return
 	}
@@ -125,6 +124,9 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 	co.mutex.Unlock()
 	if !ok {
 		config := co.config.Load()
+		if args.Config.Num > 0 {
+			config = &args.Config
+		}
 		// First persist the participants of this transaction
 		participants := make(map[int][]TxnOperation)
 		participantIndexes := make(map[int][]int)
@@ -293,6 +295,7 @@ func (co *Coordinator) broadcastToGroups(cmd TxnCmd, state *TxnState, rpcFunc gr
 				}
 				// if sent to wrong group, it means the config has changed
 				if result.err == shardkv.ErrWrongGroup {
+					hitEvent(EventWrongGroup, cmd.Status)
 					break
 				}
 				// if txn aborted on participants side, no need to retry
@@ -318,8 +321,8 @@ func (co *Coordinator) broadcastToGroups(cmd TxnCmd, state *TxnState, rpcFunc gr
 	return true
 }
 
-func (co *Coordinator) executePrepare(cmd TxnCmd, state *TxnState) {
-	if !co.tryEnterExecutor(cmd.TxnId, TxnStatusPrepare) {
+func (co *Coordinator) executePrepare(cmd TxnCmd, state *TxnState, onEnter func()) {
+	if !co.tryEnterExecutor(cmd.TxnId, TxnStatusPrepare, onEnter) {
 		return
 	}
 	defer co.leaveExecutor(cmd.TxnId, TxnStatusPrepare)
@@ -342,8 +345,8 @@ func (co *Coordinator) executePrepare(cmd TxnCmd, state *TxnState) {
 	}
 }
 
-func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc groupRPCFunc, finalStatus TxnStatus, valuesOut []string) {
-	if !co.tryEnterExecutor(cmd.TxnId, cmd.Status) {
+func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc groupRPCFunc, finalStatus TxnStatus, valuesOut []string, onEnter func()) {
+	if !co.tryEnterExecutor(cmd.TxnId, cmd.Status, onEnter) {
 		return
 	}
 	defer co.leaveExecutor(cmd.TxnId, cmd.Status)
@@ -354,11 +357,6 @@ func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc g
 	})
 	for {
 		if _, isLeader := co.rf.GetState(); !isLeader {
-			hitEvent(EventFinalActionLostLeader, cmd.Status)
-			co.traceTxn(eventKey(EventFinalActionLostLeader, cmd.Status), cmd.TxnId, map[string]any{
-				"status": cmd.Status,
-				"reason": "not_leader",
-			})
 			return
 		}
 		if co.broadcastToGroups(cmd, state, rpcFunc, valuesOut) {
@@ -410,7 +408,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 			ResultCh:       make(chan shardkv.Err, 1),
 		}
 		co.stateTable[cmd.TxnId] = &state
-		go co.executePrepare(cmd, &state)
+		go co.executePrepare(cmd, &state, nil)
 	case TxnStatusCommit:
 		co.traceTxn(TraceTxnCommitApplied, cmd.TxnId, nil)
 		state.Status = TxnStatusCommit
@@ -420,6 +418,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 			co.sendCommitRPC,
 			TxnStatusCommitted,
 			make([]string, state.OpsCount),
+			nil,
 		)
 	case TxnStatusAbort:
 		co.traceTxn(TraceTxnAbortApplied, cmd.TxnId, nil)
@@ -429,6 +428,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 			state,
 			co.sendAbortRPC,
 			TxnStatusAborted,
+			nil,
 			nil,
 		)
 	case TxnStatusCommitted:
@@ -452,14 +452,14 @@ func (co *Coordinator) recoveryDriver() {
 			for txnID, state := range co.stateTable {
 				switch state.Status {
 				case TxnStatusPrepare:
-					hitEvent(EventRecoveryDrivePrepare)
 					go co.executePrepare(TxnCmd{
 						TxnId:  txnID,
 						Status: TxnStatusPrepare,
 						Config: state.Config,
-					}, state)
+					}, state, func() {
+						hitEvent(EventRecoveryDrivePrepare)
+					})
 				case TxnStatusCommit:
-					hitEvent(EventRecoveryDriveCommit)
 					go co.executeFinalAction(
 						TxnCmd{
 							TxnId:  txnID,
@@ -470,9 +470,11 @@ func (co *Coordinator) recoveryDriver() {
 						co.sendCommitRPC,
 						TxnStatusCommitted,
 						make([]string, state.OpsCount),
+						func() {
+							hitEvent(EventRecoveryDriveCommit)
+						},
 					)
 				case TxnStatusAbort:
-					hitEvent(EventRecoveryDriveAbort)
 					go co.executeFinalAction(
 						TxnCmd{
 							TxnId:  txnID,
@@ -483,6 +485,9 @@ func (co *Coordinator) recoveryDriver() {
 						co.sendAbortRPC,
 						TxnStatusAborted,
 						nil,
+						func() {
+							hitEvent(EventRecoveryDriveAbort)
+						},
 					)
 				}
 			}

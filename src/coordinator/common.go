@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"fmt"
 	"sync"
 
 	"6.5840/shardctrler"
@@ -12,6 +13,7 @@ type TxnOperation = shardkv.TxnOperation
 type TxnArgs struct {
 	TxnId      string
 	Operations []TxnOperation
+	Config     shardctrler.Config // only for testing
 }
 
 type TxnReply = shardkv.TxnResult
@@ -48,16 +50,16 @@ type TxnState struct {
 }
 
 const (
-	EventTxnRejectNotLeader    = "TxnRejectNotLeader"
 	EventPrepareLostLeader     = "TxnPrepareLostLeader"
 	EventPrepareFailed         = "TxnPrepareFailed"
-	EventFinalActionLostLeader = "TxnFinalActionLostLeader"
 	EventFinalActionRetry      = "TxnFinalActionRetry"
+	EventFinalActionLostLeader = "TxnFinalActionLostLeader"
 	EventRecoveryDrivePrepare  = "TxnRecoveryDrivePrepare"
 	EventRecoveryDriveCommit   = "TxnRecoveryDriveCommit"
 	EventRecoveryDriveAbort    = "TxnRecoveryDriveAbort"
 	EventSnapshotSave          = "TxnSnapshotSave"
 	EventSnapshotLoad          = "TxnSnapshotLoad"
+	EventWrongGroup            = "TxnWrongGroup"
 )
 
 const (
@@ -100,6 +102,11 @@ func eventKey(name string, status TxnStatus) string {
 		if status == TxnStatusAbort {
 			return "TxnAbortRetry"
 		}
+	case EventWrongGroup:
+		if status == TxnStatusPrepare {
+			return "TxnWrongGroupOnPrepare"
+		}
+		panic(fmt.Sprintf("Got unexpected ErrWrongGroup on status=%s", status))
 	}
 	return name
 }

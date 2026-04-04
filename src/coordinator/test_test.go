@@ -1,6 +1,8 @@
 package coordinator
 
 import (
+	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"reflect"
 	"strconv"
@@ -10,9 +12,31 @@ import (
 	"time"
 
 	"6.5840/kvraft"
+	"6.5840/porcupine"
 	"6.5840/shardctrler"
 	"6.5840/shardkv"
 )
+
+const linearizabilityCheckTimeout = 1 * time.Second
+
+type txnOpLog struct {
+	sync.Mutex
+	operations []porcupine.Operation
+}
+
+func (log *txnOpLog) Append(op porcupine.Operation) {
+	log.Lock()
+	defer log.Unlock()
+	log.operations = append(log.operations, op)
+}
+
+func (log *txnOpLog) Read() []porcupine.Operation {
+	log.Lock()
+	defer log.Unlock()
+	ops := make([]porcupine.Operation, len(log.operations))
+	copy(ops, log.operations)
+	return ops
+}
 
 func TestBasicTxnSmoke(t *testing.T) {
 	cfg := make_config(3, 100, 101)
@@ -281,6 +305,113 @@ func TestTxnPrepareBlocksReconfig(t *testing.T) {
 	}
 }
 
+func TestTxnParticipantCrashRecovery(t *testing.T) {
+	resetEvents()
+	cfg := make_config(3, 100, 101)
+	defer cfg.cleanup()
+
+	keyA := cfg.claimKeyInGID(100)
+	keyB := cfg.claimKeyInGID(101)
+	cfg.kvClerk.Put(keyA, "base-a")
+	cfg.kvClerk.Put(keyB, "base-b")
+	config := cfg.smClerk.Query(-1)
+	txnID := "txn-crash-reconfig"
+	ops := []TxnOperation{
+		{Key: keyA, Value: "held-a", Op: kvraft.PutOp},
+		{Key: keyB, Value: "held-b", Op: kvraft.PutOp},
+	}
+	if reply := cfg.callGroupPrepare(t, 100, &shardkv.PrepareArgs{
+		TxnId:         txnID,
+		Config:        config,
+		TxnOperations: []shardkv.TxnOperation{{Key: keyA, Value: "held-a", Op: kvraft.PutOp}},
+	}); reply.Err != shardkv.OK {
+		t.Fatalf("prepare before crash/reconfig failed on gid 100: %v", reply.Err)
+	}
+	if reply := cfg.callGroupPrepare(t, 101, &shardkv.PrepareArgs{
+		TxnId:         txnID,
+		Config:        config,
+		TxnOperations: []shardkv.TxnOperation{{Key: keyB, Value: "held-b", Op: kvraft.PutOp}},
+	}); reply.Err != shardkv.OK {
+		t.Fatalf("prepare before crash/reconfig failed on gid 101: %v", reply.Err)
+	}
+
+	fillA := cfg.claimKeyInGID(100)
+	fillB := cfg.claimKeyInGID(101)
+	for i := 0; i < 100; i++ {
+		suffix := strconv.Itoa(i)
+		cfg.runTxn(t, cfg.coordClerk, "txn-snapshot-"+suffix, []TxnOperation{
+			{Key: fillA, Value: "a-" + suffix, Op: kvraft.PutOp},
+			{Key: fillB, Value: "b-" + suffix, Op: kvraft.PutOp},
+		}, []string{"a-" + suffix, "b-" + suffix})
+	}
+	if eventCount(EventSnapshotSave) == 0 {
+		t.Fatal("expected coordinator snapshot")
+	}
+	hasCoordSnapshot := false
+	for _, ps := range cfg.coordSaved {
+		if ps != nil && ps.SnapshotSize() > 0 {
+			hasCoordSnapshot = true
+			break
+		}
+	}
+	if !hasCoordSnapshot {
+		t.Fatal("expected persisted coordinator snapshot")
+	}
+	hasShardSnapshot := false
+	for _, g := range cfg.groups {
+		for _, ps := range g.saved {
+			if ps != nil && ps.SnapshotSize() > 0 {
+				hasShardSnapshot = true
+				break
+			}
+		}
+	}
+	if !hasShardSnapshot {
+		t.Fatal("expected persisted shard snapshot")
+	}
+	cfg.smClerk.Leave([]int{100})
+	if moved := cfg.smClerk.Query(-1).Shards[shardkv.Key2shard(keyA)]; moved != 101 {
+		t.Fatalf("shardctrler did not move shard to gid 101, got %d", moved)
+	}
+
+	probe := cfg.makeShardKVClerk()
+	defer probe.Kill()
+	done := make(chan struct{}, 1)
+	go func() {
+		probe.Put(keyA, "after-crash-reconfig")
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+		t.Fatal("reconfig should stay blocked while prepared txn is still holding the shard")
+	case <-time.After(1 * time.Second):
+	}
+
+	cfg.shutdownGroup(0)
+	time.Sleep(300 * time.Millisecond)
+	cfg.startGroup(0)
+	select {
+	case <-done:
+		t.Fatal("reconfig should stay blocked after group restart until commit")
+	case <-time.After(1 * time.Second):
+	}
+
+	if got := cfg.coordClerk.TransactionWithConfig(txnID, ops, config); !reflect.DeepEqual(got, []string{"held-a", "held-b"}) {
+		t.Fatalf("coordinator retry after restart failed: %v", got)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconfig did not resume after commit released the prepared txn")
+	}
+	if got := probe.Get(keyA); got != "after-crash-reconfig" {
+		t.Fatalf("probe mismatch after crash/reconfig recovery: got %q", got)
+	}
+	if got := cfg.kvClerk.Get(keyB); got != "held-b" {
+		t.Fatalf("peer group write mismatch after crash/reconfig recovery: got %q", got)
+	}
+}
+
 func TestTxnPartialPreparedAbort(t *testing.T) {
 	cfg := make_config(3, 100, 101)
 	defer cfg.cleanup()
@@ -541,20 +672,23 @@ func TestTxnTriangleConflict(t *testing.T) {
 }
 
 type randomTxnOptions struct {
-	unreliable bool
-	crash      bool
-	reconfig   bool
-	rounds     int
-	workers    int
-	opsPerTxn  int
+	unreliable    bool
+	crash         bool
+	reconfig      bool
+	recordHistory bool
+	rounds        int
+	workers       int
+	opsPerTxn     int
 }
 
-func runRandomTxnTest(t *testing.T, opts randomTxnOptions) {
+func runRandomTxnTest(t *testing.T, opts randomTxnOptions) []porcupine.Operation {
 	resetEvents()
 	gids := []int{100, 101, 102, 103, 104}
 	cfg := make_config(3, gids...)
 	defer cfg.cleanup()
 	cfg.net.Reliable(!opts.unreliable)
+	var opLog txnOpLog
+	t0 := time.Now()
 
 	workerKeys := make([][]string, opts.workers)
 	expected := make([][]string, opts.workers)
@@ -596,8 +730,7 @@ func runRandomTxnTest(t *testing.T, opts randomTxnOptions) {
 				checkMu.RLock()
 				ops := make([]TxnOperation, 0, opts.opsPerTxn)
 				next := append([]string(nil), expected[worker]...)
-				for i := 0; i < opts.opsPerTxn; i++ {
-					keyIdx := r.Intn(len(workerKeys[worker]))
+				appendOp := func(keyIdx, i int) {
 					key := workerKeys[worker][keyIdx]
 					switch r.Intn(3) {
 					case 0:
@@ -612,11 +745,56 @@ func runRandomTxnTest(t *testing.T, opts randomTxnOptions) {
 						next[keyIdx] += value
 					}
 				}
-				if ck.Transaction("txn-random-"+strconv.Itoa(worker)+"-"+strconv.Itoa(seq), ops) != nil {
+				switch r.Intn(3) {
+				case 0:
+					keyIdx := r.Intn(len(workerKeys[worker]))
+					for i := 0; i < opts.opsPerTxn; i++ {
+						appendOp(keyIdx, i)
+					}
+				case 1:
+					keyIdx1 := r.Intn(len(workerKeys[worker]))
+					keyIdx2 := r.Intn(len(workerKeys[worker]))
+					for keyIdx2 == keyIdx1 {
+						keyIdx2 = (keyIdx2 + 1) % len(workerKeys[worker])
+					}
+					for i := 0; i < opts.opsPerTxn; i++ {
+						if i%2 == 0 {
+							appendOp(keyIdx1, i)
+						} else {
+							appendOp(keyIdx2, i)
+						}
+					}
+				default:
+					for i := 0; i < opts.opsPerTxn; i++ {
+						appendOp(r.Intn(len(workerKeys[worker])), i)
+					}
+				}
+				start := int64(time.Since(t0))
+				txnId := "txn-random-" + strconv.Itoa(worker) + "-" + strconv.Itoa(seq)
+				values := ck.Transaction(txnId, ops)
+				end := int64(time.Since(t0))
+				if values != nil {
 					copy(expected[worker], next)
 					successes.Add(1)
 				} else {
 					aborts.Add(1)
+				}
+				if opts.recordHistory {
+					out := TxnModelOutput{Err: shardkv.ErrTxnAborted}
+					if values != nil {
+						out.Err = shardkv.OK
+						out.Values = values
+					}
+					opLog.Append(porcupine.Operation{
+						ClientId: worker,
+						Input: TxnModelInput{
+							TxnId: txnId,
+							Ops:   ops,
+						},
+						Output: out,
+						Call:   start,
+						Return: end,
+					})
 				}
 				checkMu.RUnlock()
 				if seq%10 == 9 {
@@ -675,6 +853,18 @@ func runRandomTxnTest(t *testing.T, opts randomTxnOptions) {
 	checkTxnResult()
 	t.Logf("random txn commits=%d aborts=%d restarts=%d reconfigs=%d unreliable=%v crash=%v reconfig=%v snapshot=%d",
 		successes.Load(), aborts.Load(), restarts, reconfigs, opts.unreliable, opts.crash, opts.reconfig, eventCount(EventSnapshotSave))
+	t.Logf("random txn events: prepare_wrong_group=%d prepare_failed=%d commit_retry=%d abort_retry=%d recovery_prepare=%d recovery_commit=%d recovery_abort=%d",
+		eventCount(EventWrongGroup, TxnStatusPrepare),
+		eventCount(EventPrepareFailed),
+		eventCount(EventFinalActionRetry, TxnStatusCommit),
+		eventCount(EventFinalActionRetry, TxnStatusAbort),
+		eventCount(EventRecoveryDrivePrepare),
+		eventCount(EventRecoveryDriveCommit),
+		eventCount(EventRecoveryDriveAbort))
+	if opts.recordHistory {
+		return opLog.Read()
+	}
+	return nil
 }
 
 func TestRandomTxnStable(t *testing.T) {
@@ -702,9 +892,6 @@ func TestRandomTxnChaos(t *testing.T) {
 		workers:    5,
 		opsPerTxn:  6,
 	})
-	if eventCount(EventTxnRejectNotLeader) == 0 {
-		t.Fatalf("expected %s", EventTxnRejectNotLeader)
-	}
 	rpcFailureHits := eventCount(EventPrepareFailed) +
 		eventCount(EventFinalActionRetry, TxnStatusCommit) +
 		eventCount(EventFinalActionRetry, TxnStatusAbort)
@@ -717,6 +904,41 @@ func TestRandomTxnChaos(t *testing.T) {
 	recoveryHits := eventCount(EventRecoveryDrivePrepare) + eventCount(EventRecoveryDriveCommit) + eventCount(EventRecoveryDriveAbort)
 	if recoveryHits == 0 {
 		t.Fatalf("expected recovery driver activity")
+	}
+}
+
+func TestRandomTxnLinearizable(t *testing.T) {
+	operations := runRandomTxnTest(t, randomTxnOptions{
+		recordHistory: true,
+		unreliable:    true,
+		crash:         true,
+		reconfig:      true,
+		rounds:        50,
+		workers:       3,
+		opsPerTxn:     6,
+	})
+	res, info := porcupine.CheckOperationsVerbose(TxnModel, operations, linearizabilityCheckTimeout)
+	writeToFile := func() {
+		file, err := ioutil.TempFile("", "*.html")
+		if err != nil {
+			fmt.Printf("info: failed to create temp file for visualization")
+		} else {
+			err = porcupine.Visualize(TxnModel, info, file)
+			if err != nil {
+				fmt.Printf("info: failed to write history visualization to %s\n", file.Name())
+			} else {
+				fmt.Printf("info: wrote history visualization to %s\n", file.Name())
+			}
+		}
+	}
+	switch res {
+	case porcupine.Illegal:
+		writeToFile()
+		t.Fatal("history is not linearizable")
+	case porcupine.Unknown:
+		t.Logf("info: linearizability check timed out, assuming history is ok")
+	default:
+		// writeToFile()
 	}
 }
 

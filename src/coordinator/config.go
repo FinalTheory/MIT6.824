@@ -15,9 +15,12 @@ import (
 var configEndCounter atomic.Int64
 
 type group struct {
-	gid     int
-	servers []*shardkv.ShardKV
-	names   []string
+	gid       int
+	servers   []*shardkv.ShardKV
+	names     []string
+	saved     []*raft.Persister
+	endnames  [][]string
+	mendnames [][]string
 }
 
 type config struct {
@@ -62,9 +65,12 @@ func make_config(nservers int, gids ...int) *config {
 	}
 	for gi, gid := range gids {
 		g := &group{
-			gid:     gid,
-			servers: make([]*shardkv.ShardKV, nservers),
-			names:   make([]string, nservers),
+			gid:       gid,
+			servers:   make([]*shardkv.ShardKV, nservers),
+			names:     make([]string, nservers),
+			saved:     make([]*raft.Persister, nservers),
+			endnames:  make([][]string, nservers),
+			mendnames: make([][]string, nservers),
 		}
 		for i := 0; i < nservers; i++ {
 			g.names[i] = fmt.Sprintf("shard-%d-%d", gid, i)
@@ -156,13 +162,20 @@ func (cfg *config) startCtrlers() {
 func (cfg *config) startShards() {
 	for _, g := range cfg.groups {
 		for i := 0; i < cfg.nservers; i++ {
+			if g.saved[i] == nil {
+				g.saved[i] = raft.MakePersister()
+			}
+			peerEnds, peerNames := cfg.makeTrackedPeerEnds(fmt.Sprintf("shard-%d-peer-%d", g.gid, i), g.names)
+			ctrlerEnds, ctrlerNames := cfg.makeTrackedPeerEnds(fmt.Sprintf("shard-%d-ctrler-%d", g.gid, i), cfg.ctrlerNames)
+			g.endnames[i] = peerNames
+			g.mendnames[i] = ctrlerNames
 			g.servers[i] = shardkv.StartServer(
-				cfg.makePeerEnds(fmt.Sprintf("shard-%d-peer-%d", g.gid, i), g.names),
+				peerEnds,
 				i,
-				raft.MakePersister(),
-				-1,
+				g.saved[i],
+				CoordinatorRaftMaxSize,
 				g.gid,
-				cfg.makePeerEnds(fmt.Sprintf("shard-%d-ctrler-%d", g.gid, i), cfg.ctrlerNames),
+				ctrlerEnds,
 				cfg.makeEnd,
 			)
 
@@ -171,6 +184,61 @@ func (cfg *config) startShards() {
 			srv.AddService(labrpc.MakeService(g.servers[i].Raft()))
 			cfg.net.AddServer(g.names[i], srv)
 		}
+	}
+}
+
+func (cfg *config) shutdownShardServer(gi int, i int) {
+	g := cfg.groups[gi]
+	for _, endname := range g.endnames[i] {
+		cfg.net.Enable(endname, false)
+	}
+	for _, endname := range g.mendnames[i] {
+		cfg.net.Enable(endname, false)
+	}
+	cfg.net.DeleteServer(g.names[i])
+	if g.saved[i] != nil {
+		g.saved[i] = g.saved[i].Copy()
+	}
+	if kv := g.servers[i]; kv != nil {
+		kv.Kill()
+		g.servers[i] = nil
+	}
+}
+
+func (cfg *config) shutdownGroup(gi int) {
+	for i := 0; i < cfg.nservers; i++ {
+		cfg.shutdownShardServer(gi, i)
+	}
+}
+
+func (cfg *config) startShardServer(gi int, i int) {
+	g := cfg.groups[gi]
+	peerEnds, peerNames := cfg.makeTrackedPeerEnds(fmt.Sprintf("shard-%d-peer-%d", g.gid, i), g.names)
+	ctrlerEnds, ctrlerNames := cfg.makeTrackedPeerEnds(fmt.Sprintf("shard-%d-ctrler-%d", g.gid, i), cfg.ctrlerNames)
+	g.endnames[i] = peerNames
+	g.mendnames[i] = ctrlerNames
+	if g.saved[i] != nil {
+		g.saved[i] = g.saved[i].Copy()
+	}
+	g.servers[i] = shardkv.StartServer(
+		peerEnds,
+		i,
+		g.saved[i],
+		CoordinatorRaftMaxSize,
+		g.gid,
+		ctrlerEnds,
+		cfg.makeEnd,
+	)
+
+	srv := labrpc.MakeServer()
+	srv.AddService(labrpc.MakeService(g.servers[i]))
+	srv.AddService(labrpc.MakeService(g.servers[i].Raft()))
+	cfg.net.AddServer(g.names[i], srv)
+}
+
+func (cfg *config) startGroup(gi int) {
+	for i := 0; i < cfg.nservers; i++ {
+		cfg.startShardServer(gi, i)
 	}
 }
 

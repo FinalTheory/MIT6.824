@@ -193,8 +193,9 @@
 当前已经补上的测试大致分为三层：
 
 - 基础 correctness：基本跨 group 成功路径、幂等 retry、空事务 / 单 participant / 单 key 单操作边界、同一 `txnID` 重复调用时以第一次结果为准
-- 定向协议语义：冲突 abort、同 key 多次操作顺序与返回值、`Abort` 先到后的 tombstone、participant commit 幂等、triangle conflict、`Prepare` 挡住 reconfig、部分 participant 已 prepared 时的全局 abort
-- 随机扰动回归：统一的随机事务框架支持 `unreliable`、`long reordering`、coordinator crash/restart 与动态 reconfig 的组合开关；worker 间不共享 key，因此可以持续做强最终值检查。随机测试还额外接入了一套轻量事件 recorder，用来确认诸如 not-leader、group RPC failure、recovery driver 与 snapshot save/load 等关键路径确实被触发
+- 定向协议语义：冲突 abort、同 key 多次操作顺序与返回值、`Abort` 先到后的 tombstone、participant commit 幂等、triangle conflict、`Prepare` 挡住 reconfig、部分 participant 已 prepared 时的全局 abort、跨 group prepared txn 在 reconfig 与 shard group crash/restart 之后仍可由 coordinator 路径完成 commit，且 config 只在事务终结后继续推进
+- 随机扰动回归：统一的随机事务框架支持 `unreliable`、`long reordering`、coordinator crash/restart 与动态 reconfig 的组合开关；worker 间不共享 key，因此可以持续做强最终值检查。随机测试还额外接入了一套轻量事件 recorder，用来确认诸如 prepare 失败、final action retry、recovery driver 与 snapshot save/load 等关键路径确实被触发
+- 高层语义检查：已经补上基于 history 的事务接口层线性化测试，直接对 `Transaction(txnID, ops) -> []string/nil` 做 Porcupine 检查
 
 随机测试目前保持一个刻意的限制：
 
@@ -205,16 +206,9 @@
 以下测试运行期间要不停进行reconfig，并且最终需要打点确认逻辑分支真的有走到。
 
 - coordinator 在事务中间态附近 crash/restart，随后由 recovery driver 继续推进到终态
-- snapshot 真正触发后的恢复路径测试：coordinator / participant 在快照后重启，事务状态、锁状态与最终 `Values` 仍一致
 - unreliable network 下的幂等测试：`Prepare/Commit/Abort` 请求或 reply 丢失后重试，participant 仍保持幂等，`Commit` 重试仍返回同样的 `Values`
 - unreliable network 下的部分送达测试：只有部分 participant 收到 `Prepare/Commit/Abort`，随后通过重试或 leader 接手最终收敛到全局一致结果
-- unreliable network 叠加 coordinator leader 切换：旧 leader 只完成部分 RPC 发送后失效，新 leader 通过 recovery driver 继续推进未决事务
-- client 到 coordinator 的事务 reply 丢失测试：客户端以同一 `txnID` 重试 `Transaction` 时，最终返回结果保持一致
-- coordinator leader 在事务中途切换，但客户端只通过同一 `txnID` 做无感重试，最终仍返回一致结果
-
-#### 单独保留的高层语义测试
-
-- 事务模型检查：后续可为 coordinator 的 `Transaction(txnID, ops) -> []string/nil` 增加一层基于 history 的线性化测试；当前只计划检查事务接口层能否被解释为某个合法的线性化顺序，不进一步扩展成更一般的串行化/隔离级别验证
+- unreliable network 叠加 coordinator leader 切换与客户端同 `txnID` 重试：旧 leader 只完成部分 RPC 发送后失效，随后由新 leader 和客户端重试共同推动事务收敛，并保持返回结果一致
 
 ## 维护规则
 

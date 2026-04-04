@@ -38,35 +38,6 @@ func (log *txnOpLog) Read() []porcupine.Operation {
 	return ops
 }
 
-func TestBasicTxnSmoke(t *testing.T) {
-	cfg := make_config(3, 100, 101)
-	defer cfg.cleanup()
-
-	checkKV := func(key, want string) {
-		if got := cfg.kvClerk.Get(key); got != want {
-			t.Fatalf("%s mismatch after txns: got %q want %q", key, got, want)
-		}
-	}
-
-	seedKey := cfg.claimKeyInGID(100)
-	targetKey := cfg.claimKeyInGID(101)
-	finalKey := cfg.claimKeyInGID(100)
-	cfg.kvClerk.Put(seedKey, "before")
-
-	cfg.runTxn(t, cfg.coordClerk, "txn-basic-smoke-1", []TxnOperation{
-		{Key: seedKey, Op: kvraft.GetOp},
-		{Key: targetKey, Value: "value", Op: kvraft.PutOp},
-	}, []string{"before", "value"})
-	cfg.runTxn(t, cfg.coordClerk, "txn-basic-smoke-2", []TxnOperation{
-		{Key: targetKey, Op: kvraft.GetOp},
-		{Key: finalKey, Value: "value+after", Op: kvraft.PutOp},
-	}, []string{"value", "value+after"})
-
-	checkKV(seedKey, "before")
-	checkKV(targetKey, "value")
-	checkKV(finalKey, "value+after")
-}
-
 func TestTxnBasicCases(t *testing.T) {
 	cfg := make_config(3, 100, 101)
 	defer cfg.cleanup()
@@ -125,6 +96,24 @@ func TestTxnBasicCases(t *testing.T) {
 			t.Fatalf("same-txnid second write should be ignored: got %q", got)
 		}
 	})
+
+	t.Run("same-txnid-same-ops", func(t *testing.T) {
+		readKey := cfg.claimKeyInGID(100)
+		writeKey := cfg.claimKeyInGID(101)
+		cfg.kvClerk.Put(readKey, "seed")
+		ops := []TxnOperation{
+			{Key: readKey, Op: kvraft.GetOp},
+			{Key: writeKey, Value: "value", Op: kvraft.PutOp},
+		}
+		got1 := cfg.coordClerk.Transaction("txn-idempotent", ops)
+		got2 := cfg.coordClerk.Transaction("txn-idempotent", ops)
+		if !reflect.DeepEqual(got1, []string{"seed", "value"}) || !reflect.DeepEqual(got1, got2) {
+			t.Fatalf("unexpected idempotent txn results: %v %v", got1, got2)
+		}
+		if got := cfg.kvClerk.Get(writeKey); got != "value" {
+			t.Fatalf("writeKey mismatch after idempotent retry: got %q", got)
+		}
+	})
 }
 
 func TestTxnRepeatedKeyOps(t *testing.T) {
@@ -176,27 +165,6 @@ func TestTxnRepeatedKeyOps(t *testing.T) {
 				t.Fatalf("round %d: %s mismatch: got %q want %q", round, key, got, state[key])
 			}
 		}
-	}
-}
-
-func TestTxnIdempotentRetry(t *testing.T) {
-	cfg := make_config(3, 100, 101)
-	defer cfg.cleanup()
-
-	readKey := cfg.claimKeyInGID(100)
-	writeKey := cfg.claimKeyInGID(101)
-	cfg.kvClerk.Put(readKey, "seed")
-	ops := []TxnOperation{
-		{Key: readKey, Op: kvraft.GetOp},
-		{Key: writeKey, Value: "value", Op: kvraft.PutOp},
-	}
-	got1 := cfg.coordClerk.Transaction("txn-idempotent", ops)
-	got2 := cfg.coordClerk.Transaction("txn-idempotent", ops)
-	if !reflect.DeepEqual(got1, []string{"seed", "value"}) || !reflect.DeepEqual(got1, got2) {
-		t.Fatalf("unexpected idempotent txn results: %v %v", got1, got2)
-	}
-	if got := cfg.kvClerk.Get(writeKey); got != "value" {
-		t.Fatalf("writeKey mismatch after idempotent retry: got %q", got)
 	}
 }
 

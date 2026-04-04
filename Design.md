@@ -190,12 +190,9 @@
 
 ### 2. 测试覆盖
 
-#### 需要定向构造的场景
-
-- reconfiguration 交互测试：`Prepare` 成功后，命中 `shardsToSend` 的 config change 会被挡住；事务 `Commit/Abort` 后配置可继续推进
-- 更复杂的 abort 时序测试：部分 participant 已 `Prepared`、部分尚未 `Prepare` 时全局 abort，验证已 prepared 一侧解锁、未 prepare 一侧保留 tombstone
-
 #### 可以主要依赖随机 crash / unreliable network 覆盖的场景
+
+以下测试运行期间要不停进行reconfig
 
 - coordinator 在事务中间态附近 crash/restart，随后由 recovery driver 继续推进到终态
 - snapshot 真正触发后的恢复路径测试：coordinator / participant 在快照后重启，事务状态、锁状态与最终 `Values` 仍一致

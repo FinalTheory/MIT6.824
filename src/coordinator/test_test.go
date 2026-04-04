@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
 	"6.5840/kvraft"
 	"6.5840/shardctrler"
@@ -229,6 +230,113 @@ func TestTxnConflictAbort(t *testing.T) {
 		if reply := cfg.callGroupAbort(t, 100, &shardkv.AbortArgs{TxnId: holderID}); reply.Err != shardkv.OK {
 			t.Fatalf("round %d: abort lock holder failed: %v", round, reply.Err)
 		}
+	}
+}
+
+func TestTxnPrepareBlocksReconfig(t *testing.T) {
+	cfg := make_config(3, 100, 101)
+	defer cfg.cleanup()
+
+	key := cfg.claimKeyInGID(100)
+	cfg.kvClerk.Put(key, "base")
+	config := cfg.smClerk.Query(-1)
+	if reply := cfg.callGroupPrepare(t, 100, &shardkv.PrepareArgs{
+		TxnId:         "txn-reconfig-hold",
+		Config:        config,
+		TxnOperations: []shardkv.TxnOperation{{Key: key, Value: "held", Op: kvraft.PutOp}},
+	}); reply.Err != shardkv.OK {
+		t.Fatalf("prepare before reconfig failed: %v", reply.Err)
+	}
+	cfg.smClerk.Leave([]int{100})
+	if moved := cfg.smClerk.Query(-1).Shards[shardkv.Key2shard(key)]; moved != 101 {
+		t.Fatalf("shardctrler did not move shard to gid 101, got %d", moved)
+	}
+	// Use a fresh clerk so it routes from the controller's latest config
+	// immediately; this lets us observe that reconfig appears blocked from the
+	// client side while the prepared txn is still holding the old shard owner.
+	probe := cfg.makeShardKVClerk()
+	defer probe.Kill()
+	done := make(chan struct{}, 1)
+	go func() {
+		probe.Put(key, "after-reconfig")
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+		t.Fatal("reconfig should stay blocked while prepared txn is still holding the shard")
+	case <-time.After(1 * time.Second):
+	}
+	if reply := cfg.callGroupAbort(t, 100, &shardkv.AbortArgs{TxnId: "txn-reconfig-hold"}); reply.Err != shardkv.OK {
+		t.Fatalf("abort after reconfig failed: %v", reply.Err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconfig did not resume after abort released the prepared txn")
+	}
+	if got := probe.Get(key); got != "after-reconfig" {
+		t.Fatalf("reconfig probe mismatch after unblock: got %q", got)
+	}
+}
+
+func TestTxnPartialPreparedAbort(t *testing.T) {
+	cfg := make_config(3, 100, 101)
+	defer cfg.cleanup()
+
+	keyA := cfg.claimKeyInGID(100)
+	keyB := cfg.claimKeyInGID(101)
+	probeB := cfg.claimKeyInGID(101)
+	cfg.kvClerk.Put(keyA, "base-a")
+	cfg.kvClerk.Put(keyB, "base-b")
+	cfg.kvClerk.Put(probeB, "base-probe-b")
+	config := cfg.smClerk.Query(-1)
+	txnID := "txn-partial-abort"
+	if reply := cfg.callGroupPrepare(t, 100, &shardkv.PrepareArgs{
+		TxnId:         txnID,
+		Config:        config,
+		TxnOperations: []shardkv.TxnOperation{{Key: keyA, Value: "prepared-a", Op: kvraft.PutOp}},
+	}); reply.Err != shardkv.OK {
+		t.Fatalf("prepared side failed: %v", reply.Err)
+	}
+	if reply := cfg.callGroupAbort(t, 101, &shardkv.AbortArgs{TxnId: txnID}); reply.Err != shardkv.OK {
+		t.Fatalf("unprepared side tombstone failed: %v", reply.Err)
+	}
+	if got := cfg.coordClerk.Transaction(txnID, []TxnOperation{
+		{Key: keyA, Value: "prepared-a", Op: kvraft.PutOp},
+		{Key: keyB, Value: "prepared-b", Op: kvraft.PutOp},
+	}); got != nil {
+		t.Fatalf("partial prepared txn should abort globally, got %v", got)
+	}
+	if got := cfg.kvClerk.Get(keyA); got != "base-a" {
+		t.Fatalf("prepared side should roll back after global abort, got %q", got)
+	}
+	if got := cfg.kvClerk.Get(keyB); got != "base-b" {
+		t.Fatalf("unprepared side should stay unchanged after global abort, got %q", got)
+	}
+	for _, tc := range []struct {
+		gid int
+		key string
+	}{
+		{gid: 101, key: keyB},
+		{gid: 100, key: keyA},
+	} {
+		if reply := cfg.callGroupPrepare(t, tc.gid, &shardkv.PrepareArgs{
+			TxnId:         txnID,
+			Config:        config,
+			TxnOperations: []shardkv.TxnOperation{{Key: tc.key, Value: "late", Op: kvraft.PutOp}},
+		}); reply.Err != shardkv.ErrTxnAborted {
+			t.Fatalf("gid %d got %v", tc.gid, reply.Err)
+		}
+	}
+	cfg.runTxn(t, cfg.coordClerk, "txn-after-partial-abort", []TxnOperation{
+		{Key: keyA, Value: "after-a", Op: kvraft.PutOp},
+		{Key: probeB, Value: "after-b", Op: kvraft.PutOp},
+	}, []string{"after-a", "after-b"})
+	if got := cfg.kvClerk.Get(keyA); got != "after-a" {
+		t.Fatalf("prepared side should be unlocked after global abort, got %q", got)
+	}
+	if got := cfg.kvClerk.Get(probeB); got != "after-b" {
+		t.Fatalf("new txn on unaffected key should succeed after global abort, got %q", got)
 	}
 }
 

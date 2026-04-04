@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"math/rand"
 	"reflect"
 	"strconv"
 	"testing"
@@ -37,6 +38,118 @@ func TestBasicTxnSmoke(t *testing.T) {
 	checkKV(seedKey, "before")
 	checkKV(targetKey, "value")
 	checkKV(finalKey, "value+after")
+}
+
+func TestTxnBasicCases(t *testing.T) {
+	cfg := make_config(3, 100, 101)
+	defer cfg.cleanup()
+
+	t.Run("nil", func(t *testing.T) {
+		cfg.runTxn(t, cfg.coordClerk, "txn-empty", nil, []string{})
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		cfg.runTxn(t, cfg.coordClerk, "txn-empty", []TxnOperation{}, []string{})
+	})
+
+	t.Run("single-participant", func(t *testing.T) {
+		readKey := cfg.claimKeyInGID(100)
+		writeKey := cfg.claimKeyInGID(100)
+		cfg.kvClerk.Put(readKey, "seed")
+		cfg.runTxn(t, cfg.coordClerk, "txn-single-group", []TxnOperation{
+			{Key: readKey, Op: kvraft.GetOp},
+			{Key: writeKey, Value: "value", Op: kvraft.PutOp},
+		}, []string{"seed", "value"})
+		if got := cfg.kvClerk.Get(writeKey); got != "value" {
+			t.Fatalf("single-participant write mismatch: got %q", got)
+		}
+	})
+
+	t.Run("single-key-single-op", func(t *testing.T) {
+		key := cfg.claimKeyInGID(101)
+		cfg.runTxn(t, cfg.coordClerk, "txn-single-op", []TxnOperation{
+			{Key: key, Value: "once", Op: kvraft.PutOp},
+		}, []string{"once"})
+		if got := cfg.kvClerk.Get(key); got != "once" {
+			t.Fatalf("single-op write mismatch: got %q", got)
+		}
+	})
+
+	t.Run("same-txnid-different-ops", func(t *testing.T) {
+		readKey := cfg.claimKeyInGID(100)
+		firstWriteKey := cfg.claimKeyInGID(101)
+		secondWriteKey := cfg.claimKeyInGID(101)
+		cfg.kvClerk.Put(readKey, "seed")
+		firstOps := []TxnOperation{
+			{Key: readKey, Op: kvraft.GetOp},
+			{Key: firstWriteKey, Value: "first", Op: kvraft.PutOp},
+		}
+		secondOps := []TxnOperation{
+			{Key: readKey, Op: kvraft.GetOp},
+			{Key: secondWriteKey, Value: "second", Op: kvraft.PutOp},
+		}
+		want := []string{"seed", "first"}
+		cfg.runTxn(t, cfg.coordClerk, "txn-same-id", firstOps, want)
+		cfg.runTxn(t, cfg.coordClerk, "txn-same-id", secondOps, want)
+		if got := cfg.kvClerk.Get(firstWriteKey); got != "first" {
+			t.Fatalf("same-txnid first write mismatch: got %q", got)
+		}
+		if got := cfg.kvClerk.Get(secondWriteKey); got != "" {
+			t.Fatalf("same-txnid second write should be ignored: got %q", got)
+		}
+	})
+}
+
+func TestTxnRepeatedKeyOps(t *testing.T) {
+	cfg := make_config(3, 100, 101, 102, 103, 104)
+	defer cfg.cleanup()
+
+	keys := []string{
+		cfg.claimKeyInGID(100),
+		cfg.claimKeyInGID(101),
+		cfg.claimKeyInGID(102),
+		cfg.claimKeyInGID(103),
+		cfg.claimKeyInGID(104),
+	}
+	build := func(round int, count int) ([]TxnOperation, []string, map[string]string) {
+		r := rand.New(rand.NewSource(int64(round + 1)))
+		state := map[string]string{}
+		for i, key := range keys {
+			state[key] = "base-" + strconv.Itoa(i) + "-" + strconv.Itoa(round)
+		}
+		ops, want := make([]TxnOperation, 0, count), make([]string, 0, count)
+		for i := 0; i < count; i++ {
+			key := keys[r.Intn(len(keys))]
+			switch r.Intn(3) {
+			case 0:
+				ops = append(ops, TxnOperation{Key: key, Op: kvraft.GetOp})
+				want = append(want, state[key])
+			case 1:
+				value := "put-" + strconv.Itoa(round) + "-" + strconv.Itoa(i)
+				ops = append(ops, TxnOperation{Key: key, Value: value, Op: kvraft.PutOp})
+				state[key] = value
+				want = append(want, value)
+			default:
+				value := "+app-" + strconv.Itoa(round) + "-" + strconv.Itoa(i)
+				ops = append(ops, TxnOperation{Key: key, Value: value, Op: kvraft.AppendOp})
+				state[key] += value
+				want = append(want, state[key])
+			}
+		}
+		return ops, want, state
+	}
+	for round := 0; round < 10; round++ {
+		for i, key := range keys {
+			cfg.kvClerk.Put(key, "base-"+strconv.Itoa(i)+"-"+strconv.Itoa(round))
+		}
+		ops, want, state := build(round, 30)
+		cfg.runTxn(t, cfg.coordClerk, "txn-repeated-key-"+strconv.Itoa(round), ops, want)
+		for _, key := range keys {
+			if got := cfg.kvClerk.Get(key); got != state[key] {
+				t.Fatalf("round %d: %s mismatch: got %q want %q", round, key, got, state[key])
+			}
+		}
+	}
 }
 
 func TestTxnIdempotentRetry(t *testing.T) {

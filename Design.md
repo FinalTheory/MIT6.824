@@ -188,6 +188,28 @@
 
 - 如果 prepared txn 可以延后 config apply，那么“哪些 config change 会被阻塞”的具体判定规则还可以继续细化；当前最小实现已经做到：只要未决 txn 的读写锁集合命中本次 `shardsToSend`，就延后该次 config apply
 
+### 2. 测试覆盖
+
+#### 需要定向构造的场景
+
+- reconfiguration 交互测试：`Prepare` 成功后，命中 `shardsToSend` 的 config change 会被挡住；事务 `Commit/Abort` 后配置可继续推进
+- 更复杂的 abort 时序测试：部分 participant 已 `Prepared`、部分尚未 `Prepare` 时全局 abort，验证已 prepared 一侧解锁、未 prepare 一侧保留 tombstone
+
+#### 可以主要依赖随机 crash / unreliable network 覆盖的场景
+
+- coordinator 在事务中间态附近 crash/restart，随后由 recovery driver 继续推进到终态
+- snapshot 真正触发后的恢复路径测试：coordinator / participant 在快照后重启，事务状态、锁状态与最终 `Values` 仍一致
+- unreliable network 下的幂等测试：`Prepare/Commit/Abort` 请求或 reply 丢失后重试，participant 仍保持幂等，`Commit` 重试仍返回同样的 `Values`
+- unreliable network 下的部分送达测试：只有部分 participant 收到 `Prepare/Commit/Abort`，随后通过重试或 leader 接手最终收敛到全局一致结果
+- unreliable network 叠加 coordinator leader 切换：旧 leader 只完成部分 RPC 发送后失效，新 leader 通过 recovery driver 继续推进未决事务
+- client 到 coordinator 的事务 reply 丢失测试：客户端以同一 `txnID` 重试 `Transaction` 时，最终返回结果保持一致
+- coordinator leader 在事务中途切换，但客户端只通过同一 `txnID` 做无感重试，最终仍返回一致结果
+- 多轮连续事务后的回归检查：连续执行多笔小事务后，用普通 `kvClerk` 对关键 key 做最终状态核对，检查锁泄漏与残留事务状态
+
+#### 单独保留的高层语义测试
+
+- 事务模型检查：后续可为 coordinator 的 `Transaction(txnID, ops) -> []string/nil` 增加一层基于 history 的线性化测试；当前只计划检查事务接口层能否被解释为某个合法的线性化顺序，不进一步扩展成更一般的串行化/隔离级别验证
+
 ## 维护规则
 
 - 每当某个设计讨论已经收敛，就更新这份文档

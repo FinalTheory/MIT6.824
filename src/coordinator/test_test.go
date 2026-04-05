@@ -642,6 +642,7 @@ func TestTxnTriangleConflict(t *testing.T) {
 type randomTxnOptions struct {
 	unreliable    bool
 	crash         bool
+	fatalCrash    bool
 	reconfig      bool
 	recordHistory bool
 	rounds        int
@@ -650,6 +651,9 @@ type randomTxnOptions struct {
 }
 
 func runRandomTxnTest(t *testing.T, opts randomTxnOptions) []porcupine.Operation {
+	if opts.crash && opts.fatalCrash {
+		t.Fatalf("crash and fatalCrash are mutually exclusive")
+	}
 	resetEvents()
 	gids := []int{100, 101, 102, 103, 104}
 	cfg := make_config(3, gids...)
@@ -806,6 +810,24 @@ func runRandomTxnTest(t *testing.T, opts randomTxnOptions) []porcupine.Operation
 			time.Sleep(time.Duration(50+r.Intn(100)) * time.Millisecond)
 			cfg.startCoordinator(i)
 			restarts++
+		} else if opts.fatalCrash {
+			crashed := make([]int, 0, cfg.nservers)
+			for i := 0; i < cfg.nservers; i++ {
+				if r.Intn(2) == 0 {
+					cfg.shutdownCoordinator(i)
+					crashed = append(crashed, i)
+				}
+			}
+			if len(crashed) > 0 {
+				time.Sleep(time.Duration(50+r.Intn(100)) * time.Millisecond)
+				for _, i := range crashed {
+					cfg.startCoordinator(i)
+				}
+				// we only record the fatal crashes that entire group shutdown
+				if len(crashed) == cfg.nservers {
+					restarts++
+				}
+			}
 		}
 		time.Sleep(time.Duration(100+r.Intn(150)) * time.Millisecond)
 	}
@@ -819,8 +841,8 @@ func runRandomTxnTest(t *testing.T, opts randomTxnOptions) []porcupine.Operation
 		<-finishCh
 	}
 	checkTxnResult()
-	t.Logf("random txn commits=%d aborts=%d restarts=%d reconfigs=%d unreliable=%v crash=%v reconfig=%v snapshot=%d",
-		successes.Load(), aborts.Load(), restarts, reconfigs, opts.unreliable, opts.crash, opts.reconfig, eventCount(EventSnapshotSave))
+	t.Logf("random txn commits=%d aborts=%d restarts=%d reconfigs=%d unreliable=%v crash=%v fatalCrash=%v reconfig=%v snapshot=%d",
+		successes.Load(), aborts.Load(), restarts, reconfigs, opts.unreliable, opts.crash, opts.fatalCrash, opts.reconfig, eventCount(EventSnapshotSave))
 	t.Logf("random txn events: prepare_wrong_group=%d prepare_failed=%d commit_retry=%d abort_retry=%d recovery_prepare=%d recovery_commit=%d recovery_abort=%d",
 		eventCount(EventWrongGroup, TxnStatusPrepare),
 		eventCount(EventPrepareFailed),
@@ -845,6 +867,10 @@ func TestRandomTxnUnreliable(t *testing.T) {
 
 func TestRandomTxnCrash(t *testing.T) {
 	runRandomTxnTest(t, randomTxnOptions{crash: true, rounds: 50, workers: 5, opsPerTxn: 5})
+}
+
+func TestRandomTxnFatalCrash(t *testing.T) {
+	runRandomTxnTest(t, randomTxnOptions{fatalCrash: true, rounds: 50, workers: 5, opsPerTxn: 5})
 }
 
 func TestRandomTxnReconfig(t *testing.T) {

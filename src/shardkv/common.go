@@ -198,6 +198,13 @@ func RecvWithTimeout[T any](ch <-chan T, timeout time.Duration) (T, bool) {
 }
 
 func SafeWriteChannel[T any](ch chan<- T, value T) {
+	// Result channels here are only used as best-effort in-process notifications.
+	// The real durable state lives in Raft-applied state machines, so apply paths
+	// must never block on channel delivery. A receiver may already have timed out,
+	// returned after losing leadership, or left an older result sitting in the
+	// single-slot buffer due to duplicate/idempotent apply. Blocking here would
+	// stall the single-threaded apply loop and turn a transient local wait issue
+	// into a replicated state machine liveness bug.
 	if ch != nil {
 		select {
 		case ch <- value:

@@ -45,7 +45,7 @@ type Result struct {
 }
 
 type Op struct {
-	Op    string
+	Op    kvraft.OpType
 	From  int
 	Key   string
 	Value string
@@ -234,7 +234,7 @@ func (kv *ShardKV) handleInstallShard(op Op) {
 		return
 	}
 	defer func() {
-		raft.TraceInstant(op.Op, kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
+		raft.TraceInstant(string(op.Op), kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
 			"GID":           kv.gid,
 			"op":            fmt.Sprintf("%+v", op),
 			"config":        fmt.Sprintf("%+v", *cfg),
@@ -352,7 +352,7 @@ func (kv *ShardKV) lockTxnKeys(txnID string, operations []TxnOperation) {
 		lockSet[key][txnID] = struct{}{}
 	}
 	for _, op := range operations {
-		if op.Op == kvraft.GetOp {
+		if kvraft.IsReadOperation(op.Op) {
 			readSet[op.Key] = struct{}{}
 		} else {
 			writeSet[op.Key] = struct{}{}
@@ -381,7 +381,7 @@ func (kv *ShardKV) unlockTxnKeys(txnID string, operations []TxnOperation) {
 		}
 	}
 	for _, op := range operations {
-		if op.Op == kvraft.GetOp {
+		if kvraft.IsReadOperation(op.Op) {
 			readSet[op.Key] = struct{}{}
 		} else {
 			writeSet[op.Key] = struct{}{}
@@ -714,7 +714,7 @@ func (kv *ShardKV) handleConfigChange(op Op) {
 	if len(shardsToSend) != 0 {
 		kv.sendShards(shardsToSend, op.NewConfig)
 	}
-	raft.TraceInstant(op.Op, kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
+	raft.TraceInstant(string(op.Op), kv.me, kv.gid, time.Now().UnixMicro(), map[string]any{
 		"GID":                  kv.gid,
 		"shardsToSend":         fmt.Sprintf("%v", shardsToSend),
 		"shardsToRecv":         fmt.Sprintf("%v", kv.shardsToRecv),
@@ -936,7 +936,7 @@ func (kv *ShardKV) applyTxnPrepare(cmd TxnCmd) {
 	}
 	// 4. Key conflict check
 	for _, op := range cmd.Operations {
-		if op.Op == kvraft.GetOp {
+		if kvraft.IsReadOperation(op.Op) {
 			if checkConflictExist(op.Key, &kv.txnWriteSet) {
 				return
 			}
@@ -947,7 +947,33 @@ func (kv *ShardKV) applyTxnPrepare(cmd TxnCmd) {
 			}
 		}
 	}
-	// 5. When succeed:
+	// 5. Condition check
+	for _, op := range cmd.Operations {
+		curVal, ok := kv.state[op.Key]
+		switch op.Op {
+		case kvraft.TxnCondEqual:
+			if !ok || curVal != op.Value {
+				doAbort()
+				return
+			}
+		case kvraft.TxnCondNotEqual:
+			if ok && curVal == op.Value {
+				doAbort()
+				return
+			}
+		case kvraft.TxnCondExist:
+			if !ok {
+				doAbort()
+				return
+			}
+		case kvraft.TxnCondNotExist:
+			if ok {
+				doAbort()
+				return
+			}
+		}
+	}
+	// 6. When succeed:
 	kv.lockTxnKeys(cmd.TxnId, cmd.Operations)
 	kv.txnStateLock.Lock()
 	kv.txnStateMap[cmd.TxnId] = &TxnState{
@@ -1004,6 +1030,10 @@ func (kv *ShardKV) applyTxnCommit(cmd TxnCmd) {
 				commitValues = append(commitValues, value)
 			case kvraft.GetOp:
 				commitValues = append(commitValues, curVal)
+			case kvraft.TxnCondEqual, kvraft.TxnCondNotEqual, kvraft.TxnCondExist, kvraft.TxnCondNotExist:
+				commitValues = append(commitValues, curVal)
+			default:
+				panic("invalid txn op")
 			}
 		}
 	}

@@ -15,7 +15,7 @@ type Err string
 type PutAppendArgs struct {
 	Key       string
 	Value     string
-	Op        string // "Put" or "Append"
+	Op        OpType // "Put" or "Append"
 	ClientId  int64
 	SeqNumber int32
 	// You'll have to add definitions here.
@@ -23,11 +23,22 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 }
 
+type OpType string
+
 const (
-	PutOp    = "Put"
-	AppendOp = "Append"
-	GetOp    = "Get"
+	PutOp    OpType = "Put"
+	AppendOp OpType = "Append"
+	GetOp    OpType = "Get"
+	// Transaction support
+	TxnCondEqual    OpType = "TxnCondEqual"
+	TxnCondNotEqual OpType = "TxnCondNotEqual"
+	TxnCondExist    OpType = "TxnCondExist"
+	TxnCondNotExist OpType = "TxnCondNotExist"
 )
+
+func IsReadOperation(op OpType) bool {
+	return op != PutOp && op != AppendOp
+}
 
 type PutAppendReply struct {
 	Err Err

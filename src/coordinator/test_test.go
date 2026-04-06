@@ -989,3 +989,164 @@ func TestParticipantCommitIdempotent(t *testing.T) {
 		t.Fatalf("append not committed: got %q", got)
 	}
 }
+
+func TestTxnOutboxIdempotency(t *testing.T) {
+	cfg := make_config(3, 100, 101, 102, 103)
+	cfg.net.Reliable(false)
+	defer cfg.cleanup()
+
+	// This test models a minimal outbox workflow under unreliable RPC:
+	// two producers concurrently try to publish the same business event, while
+	// two consumers concurrently try to consume that event exactly once.
+	//
+	// Producer-side idempotency is anchored by outboxKey. Consumer-side
+	// idempotency is anchored by deliveredKey.
+	orderKey := cfg.claimKeyInGID(100)
+	paymentKey := cfg.claimKeyInGID(101)
+
+	for round := 0; round < 5; round++ {
+		suffix := strconv.Itoa(round)
+		eventID := "event-" + suffix
+		outboxKey := cfg.claimKeyInGID(102)
+		deliveredKey := cfg.claimKeyInGID(103)
+		cfg.kvClerk.Put(orderKey, "PENDING")
+		cfg.kvClerk.Put(paymentKey, "INIT")
+
+		// Publish the business state change and the outbox record atomically.
+		// TxnCondNotExist(outboxKey) ensures that only one producer instance can
+		// publish this event successfully.
+		producerOps := []TxnOperation{
+			{Key: outboxKey, Op: kvraft.TxnCondNotExist},
+			{Key: orderKey, Value: "|PAID", Op: kvraft.AppendOp},
+			{Key: paymentKey, Value: "|CAPTURED", Op: kvraft.AppendOp},
+			{Key: outboxKey, Value: eventID, Op: kvraft.PutOp},
+		}
+
+		// Consume the event exactly once. The consumer first requires the outbox
+		// row to exist with the expected eventID, then writes deliveredKey behind
+		// its own idempotency guard.
+		consumerOps := []TxnOperation{
+			{Key: outboxKey, Value: eventID, Op: kvraft.TxnCondEqual},
+			{Key: deliveredKey, Op: kvraft.TxnCondNotExist},
+			{Key: deliveredKey, Value: eventID, Op: kvraft.AppendOp},
+		}
+
+		start := make(chan struct{})
+		type Result struct {
+			got []string
+			ok  bool
+		}
+		producerResults := make(chan Result, 2)
+		consumerResults := make(chan Result, 2)
+		runProducer := func(name string, probe *shardkv.Clerk) {
+			defer probe.Kill()
+			<-start
+			for attempt := 0; attempt < 20; attempt++ {
+				txnID := name + "-" + suffix + "-" + strconv.Itoa(attempt)
+				if got := cfg.coordClerk.Transaction(txnID, producerOps); got != nil {
+					producerResults <- Result{got: got, ok: true}
+					return
+				}
+				// A producer may lose the race and abort. If the outbox row is
+				// already present, the business publish has converged and this worker
+				// can stop retrying.
+				if got := probe.Get(outboxKey); got == eventID {
+					producerResults <- Result{got: nil, ok: true}
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			producerResults <- Result{ok: false}
+		}
+		runConsumer := func(name string, probe *shardkv.Clerk) {
+			defer probe.Kill()
+			<-start
+			for attempt := 0; attempt < 20; attempt++ {
+				txnID := name + "-" + suffix + "-" + strconv.Itoa(attempt)
+				if got := cfg.coordClerk.Transaction(txnID, consumerOps); got != nil {
+					consumerResults <- Result{got: got, ok: true}
+					return
+				}
+				// The consumer may race before the outbox row is visible, or lose to
+				// another successful consume retry. deliveredKey is the stable signal
+				// that consumption has already converged.
+				if got := probe.Get(deliveredKey); got == eventID {
+					consumerResults <- Result{got: nil, ok: true}
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			consumerResults <- Result{ok: false}
+		}
+		go runProducer("txn-outbox-a", cfg.makeShardKVClerk())
+		go runProducer("txn-outbox-b", cfg.makeShardKVClerk())
+		go runConsumer("txn-outbox-consumer-a", cfg.makeShardKVClerk())
+		go runConsumer("txn-outbox-consumer-b", cfg.makeShardKVClerk())
+		close(start)
+
+		producerRes1 := <-producerResults
+		producerRes2 := <-producerResults
+		consumerRes1 := <-consumerResults
+		consumerRes2 := <-consumerResults
+		if !producerRes1.ok || !producerRes2.ok {
+			t.Fatalf("round %d: concurrent outbox txn did not converge within retry budget", round)
+		}
+		if !consumerRes1.ok || !consumerRes2.ok {
+			t.Fatalf("round %d: concurrent consumer did not converge within retry budget", round)
+		}
+
+		// Final checks: one publish converged for this event, the business state
+		// change landed together with the outbox row, the consumer side also
+		// converged exactly once, and later producer/consumer retries are rejected
+		// by the idempotency guards.
+
+		if got := cfg.kvClerk.Get(outboxKey); got != eventID {
+			t.Fatalf("round %d: outbox mismatch: got %q want %q", round, got, eventID)
+		}
+		producerSuccesses := 0
+		for _, got := range [][]string{producerRes1.got, producerRes2.got} {
+			if got != nil {
+				producerSuccesses++
+				if !reflect.DeepEqual(got, []string{"", "PENDING|PAID", "INIT|CAPTURED", eventID}) {
+					t.Fatalf("round %d: unexpected successful outbox txn result: %v", round, got)
+				}
+			}
+		}
+		if producerSuccesses > 1 {
+			t.Fatalf("round %d: expected at most one concurrent outbox txn to succeed, got %d (%v, %v)", round, producerSuccesses, producerRes1.got, producerRes2.got)
+		}
+		if producerSuccesses == 0 {
+			t.Fatalf("round %d: expected one outbox txn to eventually succeed", round)
+		}
+		if got := cfg.kvClerk.Get(orderKey); got != "PENDING|PAID" {
+			t.Fatalf("round %d: order state mismatch: got %q", round, got)
+		}
+		if got := cfg.kvClerk.Get(paymentKey); got != "INIT|CAPTURED" {
+			t.Fatalf("round %d: payment state mismatch: got %q", round, got)
+		}
+		if got := cfg.coordClerk.Transaction("txn-outbox-retry-"+suffix, producerOps); got != nil {
+			t.Fatalf("round %d: duplicate outbox txn should abort, got %v", round, got)
+		}
+		if got := cfg.kvClerk.Get(deliveredKey); got != eventID {
+			t.Fatalf("round %d: delivered state mismatch: got %q want %q", round, got, eventID)
+		}
+		consumerSuccesses := 0
+		for _, got := range [][]string{consumerRes1.got, consumerRes2.got} {
+			if got != nil {
+				consumerSuccesses++
+				if !reflect.DeepEqual(got, []string{eventID, "", eventID}) {
+					t.Fatalf("round %d: unexpected consumer txn result: %v", round, got)
+				}
+			}
+		}
+		if consumerSuccesses > 1 {
+			t.Fatalf("round %d: expected at most one concurrent consumer txn to succeed, got %d (%v, %v)", round, consumerSuccesses, consumerRes1.got, consumerRes2.got)
+		}
+		if consumerSuccesses == 0 {
+			t.Fatalf("round %d: expected one consumer txn to eventually succeed", round)
+		}
+		if got := cfg.coordClerk.Transaction("txn-outbox-consumer-retry-"+suffix, consumerOps); got != nil {
+			t.Fatalf("round %d: duplicate consumer txn should abort, got %v", round, got)
+		}
+	}
+}

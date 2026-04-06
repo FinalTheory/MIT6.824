@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"6.5840/kvraft"
 	"6.5840/labrpc"
 	"6.5840/shardctrler"
 )
@@ -46,6 +47,9 @@ type Clerk struct {
 	config     shardctrler.Config
 	make_end   func(string) *labrpc.ClientEnd
 	clientId   int64
+	// Requests from the same clerk are ordered by seqCounter for dedup.
+	// A clerk is therefore expected to be used serially; concurrent reuse
+	// can cause older requests to become stale permanently.
 	seqCounter atomic.Int32
 }
 
@@ -92,6 +96,9 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
+				if ok && reply.Err == kvraft.ErrStaleRequest {
+					panic("stale ShardKV clerk request: do not reuse one clerk concurrently")
+				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
@@ -108,7 +115,7 @@ func (ck *Clerk) Get(key string) string {
 
 // shared by Put and Append.
 // You will have to modify this function.
-func (ck *Clerk) PutAppend(key string, value string, op string) {
+func (ck *Clerk) PutAppend(key string, value string, op kvraft.OpType) {
 	args := PutAppendArgs{
 		Key:       key,
 		Value:     value,
@@ -127,6 +134,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
 					return
+				}
+				if ok && reply.Err == kvraft.ErrStaleRequest {
+					panic("stale ShardKV clerk request: do not reuse one clerk concurrently")
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break

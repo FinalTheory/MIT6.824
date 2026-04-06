@@ -1,12 +1,13 @@
 package kvraft
 
 import (
-	"6.5840/labrpc"
+	"crypto/rand"
+	"math/big"
 	"sync/atomic"
 	"time"
+
+	"6.5840/labrpc"
 )
-import "crypto/rand"
-import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -76,7 +77,7 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-func (ck *Clerk) PutAppend(key string, value string, op string) {
+func (ck *Clerk) PutAppend(key string, value string, op OpType) {
 	args := PutAppendArgs{
 		Key:       key,
 		Value:     value,

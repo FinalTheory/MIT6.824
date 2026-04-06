@@ -3,6 +3,7 @@ package shardkv
 import (
 	"time"
 
+	"6.5840/kvraft"
 	"6.5840/raft"
 	"6.5840/shardctrler"
 )
@@ -39,7 +40,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	Key       string
 	Value     string
-	Op        string // "Put" or "Append"
+	Op        kvraft.OpType // "Put" or "Append"
 	ClientId  int64
 	SeqNumber int32
 }
@@ -123,7 +124,7 @@ const (
 type TxnOperation struct {
 	Key   string
 	Value string
-	Op    string // "Get" or "Put" or "Append"
+	Op    kvraft.OpType
 }
 
 type PrepareArgs struct {

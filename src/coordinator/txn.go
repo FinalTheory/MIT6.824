@@ -41,6 +41,7 @@ var TxnModel = porcupine.Model{
 		}
 		for i, op := range inp.Ops {
 			cur := next[op.Key]
+			_, exist := next[op.Key]
 			switch op.Op {
 			case kvraft.GetOp:
 				if out.Values[i] != cur {
@@ -54,6 +55,25 @@ var TxnModel = porcupine.Model{
 			case kvraft.AppendOp:
 				next[op.Key] = cur + op.Value
 				if out.Values[i] != next[op.Key] {
+					return false, state
+				}
+			case kvraft.TxnCondEqual:
+				if !exist || cur != op.Value || out.Values[i] != cur {
+					return false, state
+				}
+			case kvraft.TxnCondNotEqual:
+				if exist && cur == op.Value {
+					return false, state
+				}
+				if out.Values[i] != cur {
+					return false, state
+				}
+			case kvraft.TxnCondExist:
+				if !exist || out.Values[i] != cur {
+					return false, state
+				}
+			case kvraft.TxnCondNotExist:
+				if exist || out.Values[i] != "" {
 					return false, state
 				}
 			default:
@@ -77,6 +97,16 @@ var TxnModel = porcupine.Model{
 				parts = append(parts, fmt.Sprintf("Put(%q,%q)", op.Key, op.Value))
 			case kvraft.AppendOp:
 				parts = append(parts, fmt.Sprintf("Append(%q,%q)", op.Key, op.Value))
+			case kvraft.TxnCondEqual:
+				parts = append(parts, fmt.Sprintf("CondEqual(%q,%q)", op.Key, op.Value))
+			case kvraft.TxnCondNotEqual:
+				parts = append(parts, fmt.Sprintf("CondNotEqual(%q,%q)", op.Key, op.Value))
+			case kvraft.TxnCondExist:
+				parts = append(parts, fmt.Sprintf("CondExist(%q)", op.Key))
+			case kvraft.TxnCondNotExist:
+				parts = append(parts, fmt.Sprintf("CondNotExist(%q)", op.Key))
+			default:
+				panic("invalid op")
 			}
 		}
 		return fmt.Sprintf("%s:[%s] -> %s %s", inp.TxnId, strings.Join(parts, ", "), out.Err, fmt.Sprintf("[%s]", strings.Join(out.Values, ", ")))

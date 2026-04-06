@@ -1,15 +1,16 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"bytes"
 	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -28,7 +29,7 @@ const (
 type Op struct {
 	Key       string
 	Value     string
-	Op        string
+	Op        OpType
 	ResultCh  chan string
 	From      int
 	ClientId  int64

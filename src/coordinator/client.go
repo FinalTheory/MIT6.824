@@ -12,10 +12,8 @@ import (
 )
 
 type Clerk struct {
-	servers    []*labrpc.ClientEnd
-	clientId   int64
-	seqCounter atomic.Int32
-	dead       atomic.Bool
+	servers []*labrpc.ClientEnd
+	dead    atomic.Bool
 }
 
 func nrand() int64 {
@@ -28,8 +26,6 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	ck.clientId = nrand()
-	ck.seqCounter.Store(0)
 	ck.dead.Store(false)
 	return ck
 }

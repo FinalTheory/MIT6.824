@@ -141,14 +141,16 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 			participantIndexes[gid] = append(participantIndexes[gid], idx)
 		}
 		cmd := TxnCmd{
-			TxnId:          args.TxnId,
-			Status:         TxnStatusPrepare,
-			PrimaryGID:     primaryGID,
-			Config:         config,
-			GroupOps:       participants,
-			GroupOpIndexes: participantIndexes,
-			OpsCount:       len(args.Operations),
-			ExecutedCh:     make(chan bool, 1),
+			TxnId: args.TxnId,
+			TxnMeta: TxnMeta{
+				Status:         TxnStatusPrepare,
+				PrimaryGID:     primaryGID,
+				Config:         config,
+				GroupOps:       participants,
+				GroupOpIndexes: participantIndexes,
+				OpsCount:       len(args.Operations),
+			},
+			ExecutedCh: make(chan bool, 1),
 		}
 		if _, ok := shardkv.PersistCommand(co.rf, cmd, cmd.ExecutedCh, func() {
 			reply.Err = shardkv.ErrWrongLeader
@@ -238,8 +240,10 @@ func (co *Coordinator) stateMachineExecutor() {
 func (co *Coordinator) moveToStatus(txnId string, nextStatus TxnStatus) {
 	// use while loop to make sure op is persisted
 	cmd := TxnCmd{
-		TxnId:      txnId,
-		Status:     nextStatus,
+		TxnId: txnId,
+		TxnMeta: TxnMeta{
+			Status: nextStatus,
+		},
 		ExecutedCh: make(chan bool, 1),
 	}
 	shardkv.PersistCommand(co.rf, cmd, cmd.ExecutedCh, func() {})
@@ -385,9 +389,11 @@ func (co *Coordinator) executeFinalAction(cmd TxnCmd, state *TxnState, rpcFunc g
 		}
 		if co.broadcastToGroups(cmd, state, rpcFunc, valuesOut) {
 			nextCmd := TxnCmd{
-				TxnId:      cmd.TxnId,
-				Status:     finalStatus,
-				Values:     valuesOut,
+				TxnId: cmd.TxnId,
+				TxnMeta: TxnMeta{
+					Status: finalStatus,
+					Values: valuesOut,
+				},
 				ExecutedCh: make(chan bool, 1),
 			}
 			shardkv.PersistCommand(co.rf, nextCmd, nextCmd.ExecutedCh, func() {})
@@ -423,14 +429,8 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	case TxnStatusPrepare:
 		co.traceTxn(TraceTxnPrepareApplied, cmd.TxnId, nil)
 		state := TxnState{
-			Status:         TxnStatusPrepare,
-			PrimaryGID:     cmd.PrimaryGID,
-			Config:         cmd.Config,
-			GroupOps:       cmd.GroupOps,
-			GroupOpIndexes: cmd.GroupOpIndexes,
-			OpsCount:       cmd.OpsCount,
-			Values:         nil,
-			ResultCh:       make(chan shardkv.Err, 1),
+			TxnMeta:  cmd.TxnMeta,
+			ResultCh: make(chan shardkv.Err, 1),
 		}
 		co.stateTable[cmd.TxnId] = &state
 		go co.executePrepare(cmd, &state, nil)
@@ -480,24 +480,18 @@ func (co *Coordinator) recoveryDriver() {
 		if _, isLeader := co.rf.GetState(); isLeader {
 			co.mutex.Lock()
 			for txnID, state := range co.stateTable {
+				cmd := TxnCmd{
+					TxnId:   txnID,
+					TxnMeta: state.TxnMeta,
+				}
 				switch state.Status {
 				case TxnStatusPrepare:
-					go co.executePrepare(TxnCmd{
-						TxnId:      txnID,
-						Status:     TxnStatusPrepare,
-						PrimaryGID: state.PrimaryGID,
-						Config:     state.Config,
-					}, state, func() {
+					go co.executePrepare(cmd, state, func() {
 						hitEvent(EventRecoveryDrivePrepare)
 					})
 				case TxnStatusCommit:
 					go co.executeFinalAction(
-						TxnCmd{
-							TxnId:      txnID,
-							Status:     TxnStatusCommit,
-							PrimaryGID: state.PrimaryGID,
-							Config:     state.Config,
-						},
+						cmd,
 						state,
 						co.sendCommitRPC,
 						TxnStatusCommitted,
@@ -508,12 +502,7 @@ func (co *Coordinator) recoveryDriver() {
 					)
 				case TxnStatusAbort:
 					go co.executeFinalAction(
-						TxnCmd{
-							TxnId:      txnID,
-							Status:     TxnStatusAbort,
-							PrimaryGID: state.PrimaryGID,
-							Config:     state.Config,
-						},
+						cmd,
 						state,
 						co.sendAbortRPC,
 						TxnStatusAborted,

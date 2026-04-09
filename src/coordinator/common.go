@@ -28,27 +28,25 @@ const (
 	TxnStatusAborted   TxnStatus = "TxnStatusAborted"
 )
 
-type TxnCmd struct {
+type TxnMeta struct {
 	Status         TxnStatus
-	TxnId          string
 	PrimaryGID     int
 	Config         *shardctrler.Config
 	GroupOps       map[int][]TxnOperation // mapping from gid => list of operations
 	GroupOpIndexes map[int][]int          // mapping from gid => original op indexes
 	OpsCount       int
 	Values         []string
-	ExecutedCh     chan bool
+}
+
+type TxnCmd struct {
+	TxnId string
+	TxnMeta
+	ExecutedCh chan bool
 }
 
 type TxnState struct {
-	Status         TxnStatus
-	PrimaryGID     int
-	Config         *shardctrler.Config
-	GroupOps       map[int][]TxnOperation
-	GroupOpIndexes map[int][]int
-	OpsCount       int
-	Values         []string
-	ResultCh       chan shardkv.Err
+	TxnMeta
+	ResultCh chan shardkv.Err
 }
 
 const (

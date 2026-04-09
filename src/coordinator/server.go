@@ -130,15 +130,20 @@ func (co *Coordinator) Transaction(args *TxnArgs, reply *TxnReply) {
 		// First persist the participants of this transaction
 		participants := make(map[int][]TxnOperation)
 		participantIndexes := make(map[int][]int)
+		primaryGID := -1 // used to determine the primary commit
 		for idx, op := range args.Operations {
 			shard := shardkv.Key2shard(op.Key)
 			gid := config.Shards[shard]
+			if primaryGID == -1 {
+				primaryGID = gid
+			}
 			participants[gid] = append(participants[gid], op)
 			participantIndexes[gid] = append(participantIndexes[gid], idx)
 		}
 		cmd := TxnCmd{
 			TxnId:          args.TxnId,
 			Status:         TxnStatusPrepare,
+			PrimaryGID:     primaryGID,
 			Config:         config,
 			GroupOps:       participants,
 			GroupOpIndexes: participantIndexes,
@@ -250,10 +255,29 @@ type groupRPCResult struct {
 }
 
 func (co *Coordinator) sendPrepareRPC(srv *labrpc.ClientEnd, cmd TxnCmd, ops []TxnOperation) groupRPCResult {
-	args := shardkv.PrepareArgs{TxnId: cmd.TxnId, Config: *cmd.Config, TxnOperations: ops}
+	args := shardkv.PrepareArgs{TxnId: cmd.TxnId, PrimaryGID: cmd.PrimaryGID, Config: *cmd.Config, TxnOperations: ops}
 	var reply shardkv.PrepareReply
 	ok := srv.Call("ShardKV.Prepare", &args, &reply)
 	return groupRPCResult{ok: ok, err: reply.Err}
+}
+
+func (co *Coordinator) commitPrimary(cmd TxnCmd, state *TxnState) bool {
+	if state.PrimaryGID == -1 {
+		panic("invalid PrimaryGID")
+	}
+	servers, ok := state.Config.Groups[state.PrimaryGID]
+	if !ok || len(servers) == 0 {
+		return false
+	}
+	ops := state.GroupOps[state.PrimaryGID]
+	for _, server := range servers {
+		srv := co.make_end(server)
+		result := co.sendCommitRPC(srv, cmd, ops)
+		if result.ok && result.err == shardkv.OK {
+			return true
+		}
+	}
+	return false
 }
 
 func (co *Coordinator) sendCommitRPC(srv *labrpc.ClientEnd, cmd TxnCmd, ops []TxnOperation) groupRPCResult {
@@ -400,6 +424,7 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 		co.traceTxn(TraceTxnPrepareApplied, cmd.TxnId, nil)
 		state := TxnState{
 			Status:         TxnStatusPrepare,
+			PrimaryGID:     cmd.PrimaryGID,
 			Config:         cmd.Config,
 			GroupOps:       cmd.GroupOps,
 			GroupOpIndexes: cmd.GroupOpIndexes,
@@ -412,14 +437,19 @@ func (co *Coordinator) applyOperation(cmd TxnCmd) {
 	case TxnStatusCommit:
 		co.traceTxn(TraceTxnCommitApplied, cmd.TxnId, nil)
 		state.Status = TxnStatusCommit
-		go co.executeFinalAction(
-			cmd,
-			state,
-			co.sendCommitRPC,
-			TxnStatusCommitted,
-			make([]string, state.OpsCount),
-			nil,
-		)
+		go func() {
+			// try best effort to commit primary so as to leave an decision point in case coordinator fails
+			co.commitPrimary(cmd, state)
+			// then we execute final action
+			co.executeFinalAction(
+				cmd,
+				state,
+				co.sendCommitRPC,
+				TxnStatusCommitted,
+				make([]string, state.OpsCount),
+				nil,
+			)
+		}()
 	case TxnStatusAbort:
 		co.traceTxn(TraceTxnAbortApplied, cmd.TxnId, nil)
 		state.Status = TxnStatusAbort
@@ -453,18 +483,20 @@ func (co *Coordinator) recoveryDriver() {
 				switch state.Status {
 				case TxnStatusPrepare:
 					go co.executePrepare(TxnCmd{
-						TxnId:  txnID,
-						Status: TxnStatusPrepare,
-						Config: state.Config,
+						TxnId:      txnID,
+						Status:     TxnStatusPrepare,
+						PrimaryGID: state.PrimaryGID,
+						Config:     state.Config,
 					}, state, func() {
 						hitEvent(EventRecoveryDrivePrepare)
 					})
 				case TxnStatusCommit:
 					go co.executeFinalAction(
 						TxnCmd{
-							TxnId:  txnID,
-							Status: TxnStatusCommit,
-							Config: state.Config,
+							TxnId:      txnID,
+							Status:     TxnStatusCommit,
+							PrimaryGID: state.PrimaryGID,
+							Config:     state.Config,
 						},
 						state,
 						co.sendCommitRPC,
@@ -477,9 +509,10 @@ func (co *Coordinator) recoveryDriver() {
 				case TxnStatusAbort:
 					go co.executeFinalAction(
 						TxnCmd{
-							TxnId:  txnID,
-							Status: TxnStatusAbort,
-							Config: state.Config,
+							TxnId:      txnID,
+							Status:     TxnStatusAbort,
+							PrimaryGID: state.PrimaryGID,
+							Config:     state.Config,
 						},
 						state,
 						co.sendAbortRPC,

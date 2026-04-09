@@ -27,6 +27,7 @@ const (
 	// errors for txn
 	ErrTxnAborted  Err = "ErrTxnAborted"
 	ErrTxnInFlight Err = "ErrTxnInFlight"
+	ErrTxnNotFound Err = "ErrTxnNotFound"
 )
 
 const (
@@ -95,6 +96,7 @@ const (
 type TxnCmd struct {
 	Type       TxnOpType
 	TxnId      string
+	PrimaryGID int
 	Operations []TxnOperation
 	Config     shardctrler.Config
 	ResultCh   chan TxnResult
@@ -104,6 +106,7 @@ type TxnStatus string
 
 type TxnState struct {
 	Status     TxnStatus
+	PrimaryGID int
 	Operations []TxnOperation
 	Values     []string
 }
@@ -129,6 +132,7 @@ type TxnOperation struct {
 
 type PrepareArgs struct {
 	TxnId         string
+	PrimaryGID    int
 	TxnOperations []TxnOperation
 	Config        shardctrler.Config
 }
@@ -146,6 +150,15 @@ type CommitReply = TxnResult
 type AbortArgs = CommitArgs
 
 type AbortReply = PrepareReply
+
+type QueryTxnStatusArgs struct {
+	TxnId string
+}
+
+type QueryTxnStatusReply struct {
+	Err    Err
+	Status TxnStatus
+}
 
 const (
 	NewCmdTimeOut = 500 * time.Millisecond

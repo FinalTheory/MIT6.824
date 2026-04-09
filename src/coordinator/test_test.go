@@ -380,6 +380,75 @@ func TestTxnParticipantCrashRecovery(t *testing.T) {
 	}
 }
 
+func TestTxnPrimaryResolveAfterCoordinatorCrash(t *testing.T) {
+	cfg := make_config(3, 100, 101)
+	defer cfg.cleanup()
+
+	primaryGID := 100
+	secondaryGID := 101
+	primaryKey := cfg.claimKeyInGID(primaryGID)
+	secondaryKey := cfg.claimKeyInGID(secondaryGID)
+	cfg.kvClerk.Put(primaryKey, "base-primary")
+	cfg.kvClerk.Put(secondaryKey, "base-secondary")
+
+	config := cfg.smClerk.Query(-1)
+	txnID := "txn-primary-resolve"
+	ops := []TxnOperation{
+		{Key: primaryKey, Value: "|primary", Op: kvraft.AppendOp},
+		{Key: secondaryKey, Value: "|secondary", Op: kvraft.AppendOp},
+	}
+	prepare := func(gid int, op shardkv.TxnOperation) {
+		if reply := cfg.callGroupPrepare(t, gid, &shardkv.PrepareArgs{
+			TxnId:         txnID,
+			PrimaryGID:    primaryGID,
+			Config:        config,
+			TxnOperations: []shardkv.TxnOperation{op},
+		}); reply.Err != shardkv.OK {
+			t.Fatalf("prepare failed on gid %d: %v", gid, reply.Err)
+		}
+	}
+
+	// Manually drive Prepare on both participants so the transaction is in a
+	// deterministic cross-group prepared state before we simulate coordinator loss.
+	prepare(primaryGID, shardkv.TxnOperation{Key: primaryKey, Value: "|primary", Op: kvraft.AppendOp})
+	prepare(secondaryGID, shardkv.TxnOperation{Key: secondaryKey, Value: "|secondary", Op: kvraft.AppendOp})
+
+	// Establish the primary commit point first. This simulates the coordinator
+	// having pushed the transaction far enough that secondaries can later resolve
+	// their fate by querying the primary participant.
+	if got := cfg.callGroupCommit(t, primaryGID, &shardkv.CommitArgs{TxnId: txnID}); got.Err != shardkv.OK {
+		t.Fatalf("primary commit failed: %+v", got)
+	}
+
+	// Then crash the entire coordinator group. The remaining completion of the
+	// secondary participant must now come from the participant-side resolver.
+	for i := 0; i < cfg.nservers; i++ {
+		cfg.shutdownCoordinator(i)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := cfg.kvClerk.Get(secondaryKey); got == "base-secondary|secondary" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if got := cfg.kvClerk.Get(primaryKey); got != "base-primary|primary" {
+		t.Fatalf("primary key mismatch after coordinator crash: got %q", got)
+	}
+	if got := cfg.kvClerk.Get(secondaryKey); got != "base-secondary|secondary" {
+		t.Fatalf("secondary key mismatch after coordinator crash: got %q", got)
+	}
+
+	for i := 0; i < cfg.nservers; i++ {
+		cfg.startCoordinator(i)
+	}
+	if got := cfg.coordClerk.Transaction(txnID, ops); !reflect.DeepEqual(got, []string{"base-primary|primary", "base-secondary|secondary"}) {
+		t.Fatalf("idempotent retry after coordinator restart failed: %v", got)
+	}
+}
+
 func TestTxnPartialPreparedAbort(t *testing.T) {
 	cfg := make_config(3, 100, 101)
 	defer cfg.cleanup()

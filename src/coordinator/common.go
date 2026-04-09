@@ -31,6 +31,7 @@ const (
 type TxnCmd struct {
 	Status         TxnStatus
 	TxnId          string
+	PrimaryGID     int
 	Config         *shardctrler.Config
 	GroupOps       map[int][]TxnOperation // mapping from gid => list of operations
 	GroupOpIndexes map[int][]int          // mapping from gid => original op indexes
@@ -41,6 +42,7 @@ type TxnCmd struct {
 
 type TxnState struct {
 	Status         TxnStatus
+	PrimaryGID     int
 	Config         *shardctrler.Config
 	GroupOps       map[int][]TxnOperation
 	GroupOpIndexes map[int][]int

@@ -119,6 +119,7 @@ type ShardKV struct {
 	executorKilled      atomic.Bool
 	configFetcherKilled atomic.Bool
 	sendShardsKilled    atomic.Bool
+	pendingTxnResolverKilled atomic.Bool
 
 	// states introduced for 2PC
 	txnStateMap  map[string]*TxnState
@@ -426,6 +427,7 @@ func (kv *ShardKV) Prepare(args *PrepareArgs, reply *PrepareReply) {
 	cmd := TxnCmd{
 		Type:       TxnPrepare,
 		TxnId:      args.TxnId,
+		PrimaryGID: args.PrimaryGID,
 		Operations: args.TxnOperations,
 		Config:     args.Config,
 		ResultCh:   make(chan TxnResult, 1),
@@ -437,6 +439,22 @@ func (kv *ShardKV) Prepare(args *PrepareArgs, reply *PrepareReply) {
 		return
 	}
 	reply.Err = result.Err
+}
+
+func (kv *ShardKV) QueryTxnStatus(args *QueryTxnStatusArgs, reply *QueryTxnStatusReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.txnStateLock.Lock()
+	defer kv.txnStateLock.Unlock()
+	state, ok := kv.txnStateMap[args.TxnId]
+	if !ok {
+		reply.Err = ErrTxnNotFound
+		return
+	}
+	reply.Err = OK
+	reply.Status = state.Status
 }
 
 func (kv *ShardKV) Commit(args *CommitArgs, reply *CommitReply) {
@@ -978,6 +996,7 @@ func (kv *ShardKV) applyTxnPrepare(cmd TxnCmd) {
 	kv.txnStateLock.Lock()
 	kv.txnStateMap[cmd.TxnId] = &TxnState{
 		Status:     TxnStatusPrepared,
+		PrimaryGID: cmd.PrimaryGID,
 		Operations: cmd.Operations,
 	}
 	kv.txnStateLock.Unlock()
@@ -1088,6 +1107,60 @@ func (kv *ShardKV) applyTxnAbort(cmd TxnCmd) {
 	}
 	kv.txnStateLock.Unlock()
 	SafeWriteChannel(cmd.ResultCh, TxnResult{Err: OK})
+}
+
+func (kv *ShardKV) queryPrimaryTxnStatus(txnID string, primaryGID int) (TxnStatus, bool) {
+	cfg := kv.config.Load()
+	servers, ok := cfg.Groups[primaryGID]
+	if !ok || len(servers) == 0 {
+		return "", false
+	}
+	args := QueryTxnStatusArgs{TxnId: txnID}
+	for _, server := range servers {
+		srv := kv.make_end(server)
+		var reply QueryTxnStatusReply
+		if srv.Call("ShardKV.QueryTxnStatus", &args, &reply) && reply.Err == OK {
+			return reply.Status, true
+		}
+	}
+	return "", false
+}
+
+func (kv *ShardKV) daemonPendingTxnResolver() {
+	defer kv.pendingTxnResolverKilled.Store(true)
+	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.txnStateLock.Lock()
+			pending := make([]struct {
+				txnID      string
+				primaryGID int
+			}, 0)
+			for txnID, state := range kv.txnStateMap {
+				if state.Status == TxnStatusPrepared && state.PrimaryGID != -1 && state.PrimaryGID != kv.gid {
+					pending = append(pending, struct {
+						txnID      string
+						primaryGID int
+					}{txnID: txnID, primaryGID: state.PrimaryGID})
+				}
+			}
+			kv.txnStateLock.Unlock()
+			for _, item := range pending {
+				status, ok := kv.queryPrimaryTxnStatus(item.txnID, item.primaryGID)
+				if !ok {
+					continue
+				}
+				switch status {
+				case TxnStatusCommitted:
+					resultCh := make(chan TxnResult, 1)
+					PersistCommand(kv.rf, TxnCmd{Type: TxnCommit, TxnId: item.txnID, ResultCh: resultCh}, resultCh, func() {})
+				case TxnStatusAborted:
+					resultCh := make(chan TxnResult, 1)
+					PersistCommand(kv.rf, TxnCmd{Type: TxnAbort, TxnId: item.txnID, ResultCh: resultCh}, resultCh, func() {})
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (kv *ShardKV) doSnapshot(index int) {
@@ -1222,7 +1295,10 @@ func (kv *ShardKV) Raft() *raft.Raft {
 }
 
 func (kv *ShardKV) checkKillComplete() bool {
-	return kv.executorKilled.Load() && kv.configFetcherKilled.Load() && kv.sendShardsKilled.Load()
+	return kv.executorKilled.Load() &&
+		kv.configFetcherKilled.Load() &&
+		kv.sendShardsKilled.Load() &&
+		kv.pendingTxnResolverKilled.Load()
 }
 
 func (kv *ShardKV) killed() bool {
@@ -1299,5 +1375,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.daemonSendShard()
 	go kv.stateMachineExecutor()
 	go kv.daemonConfigFetcher()
+	go kv.daemonPendingTxnResolver()
 	return kv
 }

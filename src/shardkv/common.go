@@ -24,6 +24,7 @@ const (
 	ErrNoKey       Err = "ErrNoKey"
 	ErrWrongGroup  Err = "ErrWrongGroup"
 	ErrWrongLeader Err = "ErrWrongLeader"
+	ErrTimeOut     Err = "ErrTimeOut"
 	// errors for txn
 	ErrTxnAborted  Err = "ErrTxnAborted"
 	ErrTxnInFlight Err = "ErrTxnInFlight"
@@ -59,6 +60,13 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type GetReadIndexArgs struct{}
+
+type GetReadIndexReply struct {
+	Err       Err
+	ReadIndex int
 }
 
 type InstallShardArgs struct {
@@ -161,7 +169,14 @@ type QueryTxnStatusReply struct {
 }
 
 const (
-	NewCmdTimeOut = 500 * time.Millisecond
+	NewCmdTimeOut          = 500 * time.Millisecond
+	RPCTimeout             = 60 * time.Second
+	ReadIndexRetryInterval = 25 * time.Millisecond
+	FollowerReadBatchWait  = 25 * time.Millisecond
+	FollowerReadBatchSize  = 8
+	ConfigPollInterval     = 100 * time.Millisecond
+	PendingTxnScanInterval = 100 * time.Millisecond
+	ClerkRetryInterval     = 100 * time.Millisecond
 )
 
 // PersistCommand keeps retrying rf.Start(cmd) until either:

@@ -44,6 +44,24 @@ type Result struct {
 	Valid bool
 }
 
+type LocalReadReq struct {
+	Key       string
+	ReadIndex int
+	ResultCh  chan Result
+}
+
+type SnapshotReq struct{}
+
+type FollowerReadReq struct {
+	Key       string
+	ArrivedAt time.Time
+	ResultCh  chan GetReply
+}
+
+func (req FollowerReadReq) Deadline() time.Time {
+	return req.ArrivedAt.Add(RPCTimeout)
+}
+
 type Op struct {
 	Op    kvraft.OpType
 	From  int
@@ -84,7 +102,9 @@ type ShardKV struct {
 	gid          int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
+	executeCh    chan any
 	make_end     func(string) *labrpc.ClientEnd
+	servers      []*labrpc.ClientEnd
 	mck          *shardctrler.Clerk
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
@@ -96,6 +116,12 @@ type ShardKV struct {
 	// access to K/V state is single threaded, thus no lock needed
 	state            map[string]string
 	lastAppliedIndex int
+	applyMu          sync.Mutex
+	applyNotifyCh    chan struct{}
+
+	followerReadMu    sync.Mutex
+	followerReadBatch []FollowerReadReq
+	lastLeaderIndex   atomic.Int32
 
 	rwLock sync.RWMutex
 	dedup  map[DedupKey]DedupEntry
@@ -114,11 +140,11 @@ type ShardKV struct {
 	seqCounter atomic.Int32
 
 	// states related to gracefully kill
-	dead                int32
-	killCh              chan bool
-	executorKilled      atomic.Bool
-	configFetcherKilled atomic.Bool
-	sendShardsKilled    atomic.Bool
+	dead                     int32
+	killCh                   chan struct{}
+	executorKilled           atomic.Bool
+	configFetcherKilled      atomic.Bool
+	sendShardsKilled         atomic.Bool
 	pendingTxnResolverKilled atomic.Bool
 
 	// states introduced for 2PC
@@ -174,6 +200,211 @@ func (kv *ShardKV) recordRequestAtIndex(index int, id kvraft.RequestId, failCh c
 	kv.pendingRequests[index] = kvraft.RequestInfo{RequestId: id, FailCh: failCh}
 }
 
+func (kv *ShardKV) getLastAppliedIndex() int {
+	kv.applyMu.Lock()
+	defer kv.applyMu.Unlock()
+	return kv.lastAppliedIndex
+}
+
+func (kv *ShardKV) notifyCommandApplyLocked() {
+	close(kv.applyNotifyCh)
+	kv.applyNotifyCh = make(chan struct{})
+}
+
+func (kv *ShardKV) setLastAppliedIndex(index int) {
+	kv.applyMu.Lock()
+	defer kv.applyMu.Unlock()
+	kv.lastAppliedIndex = index
+	kv.notifyCommandApplyLocked()
+}
+
+func (kv *ShardKV) waitLastAppliedIndex(targetIndex int, deadline time.Time) bool {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	for !kv.killed() {
+		kv.applyMu.Lock()
+		lastAppliedIndex := kv.lastAppliedIndex
+		notifyCh := kv.applyNotifyCh
+
+		kv.applyMu.Unlock()
+		if lastAppliedIndex >= targetIndex {
+			return true
+		}
+		select {
+		case <-notifyCh:
+		case <-timer.C:
+			return false
+		}
+	}
+	return false
+}
+
+func (kv *ShardKV) handleLocalRead(req LocalReadReq) {
+	if req.ReadIndex > kv.lastAppliedIndex {
+		panic(fmt.Sprintf("local read index %d exceeds lastAppliedIndex %d", req.ReadIndex, kv.lastAppliedIndex))
+	}
+	shard := key2shard(req.Key)
+	cfg := kv.config.Load()
+	if cfg.Shards[shard] != kv.gid {
+		SafeWriteChannel(req.ResultCh, Result{Valid: false})
+		return
+	}
+	if _, shardNotReady := kv.shardsToRecv[shard]; shardNotReady {
+		SafeWriteChannel(req.ResultCh, Result{Valid: false})
+		return
+	}
+	SafeWriteChannel(req.ResultCh, Result{Valid: true, Value: kv.state[req.Key]})
+}
+
+func (kv *ShardKV) readFromLocalState(key string, readIndex int, deadline time.Time) GetReply {
+	if !kv.waitLastAppliedIndex(readIndex, deadline) {
+		return GetReply{Err: ErrTimeOut}
+	}
+	resultCh := make(chan Result, 1)
+	select {
+	case kv.executeCh <- LocalReadReq{Key: key, ReadIndex: readIndex, ResultCh: resultCh}:
+	case <-time.After(time.Until(deadline)):
+		return GetReply{Err: ErrTimeOut}
+	}
+	select {
+	case result := <-resultCh:
+		if result.Valid {
+			return GetReply{Err: OK, Value: result.Value}
+		}
+		return GetReply{Err: ErrWrongGroup}
+	case <-time.After(time.Until(deadline)):
+		return GetReply{Err: ErrTimeOut}
+	}
+}
+
+func (kv *ShardKV) getReadIndexImpl(deadline time.Time) (int, Err) {
+	nopStarted := false
+	for time.Now().Before(deadline) && !kv.killed() {
+		readIndex := kv.rf.LeaseReadIndex()
+		if readIndex > 0 {
+			return readIndex, OK
+		}
+		if !nopStarted {
+			resultCh := make(chan Result, 1)
+			_, _, isLeader := kv.rf.Start(Op{
+				Op:       Nop,
+				ResultCh: resultCh,
+				From:     kv.me,
+			})
+			if !isLeader {
+				return -1, ErrWrongLeader
+			}
+			nopStarted = true
+			select {
+			case <-resultCh:
+			case <-time.After(time.Until(deadline)):
+				return -1, ErrTimeOut
+			}
+			continue
+		}
+		time.Sleep(ReadIndexRetryInterval)
+	}
+	return -1, ErrTimeOut
+}
+
+func (kv *ShardKV) GetReadIndex(args *GetReadIndexArgs, reply *GetReadIndexReply) {
+	readIndex, err := kv.getReadIndexImpl(time.Now().Add(RPCTimeout))
+	reply.Err = err
+	reply.ReadIndex = readIndex
+}
+
+func (kv *ShardKV) getLeaderReadIndex(deadline time.Time) (int, Err) {
+	args := GetReadIndexArgs{}
+	for time.Now().Before(deadline) && !kv.killed() {
+		start := int(kv.lastLeaderIndex.Load())
+		for offset := 0; offset < len(kv.servers); offset++ {
+			i := (start + offset) % len(kv.servers)
+			server := kv.servers[i]
+			if i == kv.me {
+				if readIndex, err := kv.getReadIndexImpl(deadline); err == OK {
+					kv.lastLeaderIndex.Store(int32(i))
+					return readIndex, OK
+				}
+			} else {
+				var reply GetReadIndexReply
+				if server.Call("ShardKV.GetReadIndex", &args, &reply) && reply.Err == OK {
+					kv.lastLeaderIndex.Store(int32(i))
+					return reply.ReadIndex, OK
+				}
+			}
+		}
+		time.Sleep(ReadIndexRetryInterval)
+	}
+	return -1, ErrTimeOut
+}
+
+func (kv *ShardKV) flushFollowerReadBatchLocked() []FollowerReadReq {
+	batch := kv.followerReadBatch
+	kv.followerReadBatch = nil
+	return batch
+}
+
+func (kv *ShardKV) flushTimeoutFollowerReadBatch() {
+	kv.followerReadMu.Lock()
+	defer kv.followerReadMu.Unlock()
+	if len(kv.followerReadBatch) > 0 && time.Since(kv.followerReadBatch[0].ArrivedAt) >= FollowerReadBatchWait {
+		go kv.processFollowerReadBatch(kv.flushFollowerReadBatchLocked())
+	}
+}
+
+func (kv *ShardKV) enqueueFollowerReadReq(req FollowerReadReq) {
+	kv.followerReadMu.Lock()
+	defer kv.followerReadMu.Unlock()
+	kv.followerReadBatch = append(kv.followerReadBatch, req)
+	if len(kv.followerReadBatch) == 1 {
+		time.AfterFunc(FollowerReadBatchWait, kv.flushTimeoutFollowerReadBatch)
+	}
+	oldest := kv.followerReadBatch[0]
+	if len(kv.followerReadBatch) >= FollowerReadBatchSize || time.Since(oldest.ArrivedAt) >= FollowerReadBatchWait {
+		go kv.processFollowerReadBatch(kv.flushFollowerReadBatchLocked())
+	}
+}
+
+func (kv *ShardKV) processFollowerReadBatch(batch []FollowerReadReq) {
+	deadline := batch[0].Deadline()
+	if !time.Now().Before(deadline) {
+		for _, req := range batch {
+			SafeWriteChannel(req.ResultCh, GetReply{Err: ErrTimeOut})
+		}
+		return
+	}
+	readIndex, err := kv.getLeaderReadIndex(deadline)
+	if err != OK {
+		for _, req := range batch {
+			SafeWriteChannel(req.ResultCh, GetReply{Err: err})
+		}
+		return
+	}
+	if !kv.waitLastAppliedIndex(readIndex, deadline) {
+		for _, req := range batch {
+			SafeWriteChannel(req.ResultCh, GetReply{Err: ErrTimeOut})
+		}
+		return
+	}
+	for _, req := range batch {
+		SafeWriteChannel(req.ResultCh, kv.readFromLocalState(req.Key, readIndex, req.Deadline()))
+	}
+}
+
+func (kv *ShardKV) handleExecute(req any) {
+	switch req := req.(type) {
+	case LocalReadReq:
+		kv.handleLocalRead(req)
+	case SnapshotReq:
+		if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+			kv.doSnapshot(kv.getLastAppliedIndex())
+		}
+	default:
+		panic(fmt.Sprintf("unknown execute request type %T", req))
+	}
+}
+
 func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply) {
 	// if the config num together with the shard data is out-dated
 	// we should return a success to stop sender from retrying
@@ -205,7 +436,7 @@ func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply
 			reply.Success = true
 		case <-failCh:
 			reply.Success = false
-		case <-time.After(time.Second * kvraft.RPCTimeout):
+		case <-time.After(RPCTimeout):
 			panic("InstallShard RPC timeout")
 		}
 	} else {
@@ -270,6 +501,31 @@ func (kv *ShardKV) handleInstallShard(op Op) {
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+	deadline := time.Now().Add(RPCTimeout)
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		readIndex, err := kv.getReadIndexImpl(deadline)
+		if err != OK {
+			reply.Err = err
+			return
+		}
+		*reply = kv.readFromLocalState(args.Key, readIndex, deadline)
+		return
+	}
+	resultCh := make(chan GetReply, 1)
+	kv.enqueueFollowerReadReq(FollowerReadReq{
+		Key:       args.Key,
+		ArrivedAt: time.Now(),
+		ResultCh:  resultCh,
+	})
+	select {
+	case result := <-resultCh:
+		*reply = result
+	case <-time.After(time.Until(deadline)):
+		reply.Err = ErrTimeOut
+	}
+}
+
+func (kv *ShardKV) GetV1(args *GetArgs, reply *GetReply) {
 	if !kv.shouldStartCommand(args.Key, args.ClientId, args.SeqNumber, &reply.Err, &reply.Value) {
 		return
 	}
@@ -335,8 +591,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			} else {
 				reply.Err = ErrWrongGroup
 			}
-		case <-time.After(time.Second * kvraft.RPCTimeout):
-			reply.Err = kvraft.ErrTimeOut
+		case <-time.After(RPCTimeout):
+			reply.Err = ErrTimeOut
 		}
 	} else {
 		reply.Err = ErrWrongLeader
@@ -556,7 +812,7 @@ func (kv *ShardKV) daemonConfigFetcher() {
 				})
 			}
 		}
-		time.Sleep(time.Millisecond * 100)
+		time.Sleep(ConfigPollInterval)
 	}
 }
 
@@ -588,10 +844,7 @@ func (kv *ShardKV) sendShardImpl(key ShardInfo) {
 			// this is only to pass challenge 1 shard deletion
 			// when all shards are sent, we'll need to trigger a snapshot to reduce its size
 			if sendNop {
-				kv.applyCh <- raft.ApplyMsg{CommandValid: true, CommandIndex: -1, Command: Op{
-					Op:   Nop,
-					From: kv.me,
-				}}
+				kv.executeCh <- SnapshotReq{}
 			}
 			return
 		}
@@ -744,7 +997,57 @@ func (kv *ShardKV) handleConfigChange(op Op) {
 	kv.config.Store(op.NewConfig)
 }
 
-func (kv *ShardKV) stateMachineExecutor() {
+func (kv *ShardKV) handleCommandApply(cmd *raft.ApplyMsg) {
+	switch cmd.Command.(type) {
+	case Op:
+		op := cmd.Command.(Op)
+		switch op.Op {
+		case Nop:
+			if op.From == kv.me {
+				SafeWriteChannel(op.ResultCh, Result{Valid: true})
+			}
+		case ConfigChange:
+			kv.DPrintf("[%d][%d] Config Change [%d] Config: %+v", kv.gid, kv.me, cmd.CommandIndex, *op.NewConfig)
+			kv.handleConfigChange(op)
+		case InstallShard:
+			kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard)
+			kv.handleInstallShard(op)
+			if op.From == kv.me && op.ResultCh != nil {
+				op.ResultCh <- Result{Valid: true, Value: ""}
+			}
+		default:
+			kv.DPrintf("[%d][%d] Apply command [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
+			cfg := kv.config.Load()
+			shard := key2shard(op.Key)
+			// do not apply operation if not owing the shard or waiting to receive this shard
+			// then the client request will fail and it will finally retry
+			_, shardNotReady := kv.shardsToRecv[shard]
+			// it is tricky here that if we update the dedup stable status, we should also increase the seqNumber once client received ErrWrongGroup
+			// we have to choose to do both or neither, otherwise the previous failed request won't be properly retried once we're ready to serve this shard
+			if cfg.Shards[shard] != kv.gid || shardNotReady {
+				if op.From == kv.me && op.ResultCh != nil {
+					kv.DPrintf("[%d][%d] Apply failed [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
+					op.ResultCh <- Result{Valid: false}
+				}
+				return
+			}
+			result := kv.applyOperation(op)
+			// only notify completion when request waiting on same server and channel available
+			// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
+			// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
+			// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
+			if op.From == kv.me && op.ResultCh != nil {
+				op.ResultCh <- Result{Valid: true, Value: result}
+			}
+		}
+	case TxnCmd:
+		kv.applyTxnOperation(cmd.Command.(TxnCmd))
+	default:
+		panic("unknown command type")
+	}
+}
+
+func (kv *ShardKV) stateMachineThread() {
 	defer kv.executorKilled.Store(true)
 	for !kv.killed() {
 		select {
@@ -754,82 +1057,35 @@ func (kv *ShardKV) stateMachineExecutor() {
 				kv.failAllPendingRequests(kvraft.ErrLostLeadership)
 				continue
 			}
-			if cmd.SnapshotValid && cmd.SnapshotIndex <= kv.lastAppliedIndex {
-				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, kv.lastAppliedIndex))
+			if cmd.SnapshotValid && cmd.SnapshotIndex <= kv.getLastAppliedIndex() {
+				panic(fmt.Sprintf("unexpected SnapshotIndex %d <= lastAppliedIndex %d", cmd.SnapshotIndex, kv.getLastAppliedIndex()))
 			}
 			if cmd.SnapshotValid {
 				kv.reloadFromSnapshot(cmd.Snapshot)
-				kv.lastAppliedIndex = cmd.SnapshotIndex
 				continue
 			}
 			if !cmd.CommandValid {
 				continue
 			}
-			kv.failConflictPendingRequests(cmd)
-			if cmd.CommandIndex != -1 && cmd.CommandIndex <= kv.lastAppliedIndex {
-				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.lastAppliedIndex))
+			if cmd.CommandIndex <= 0 {
+				panic(fmt.Sprintf("unexpected CommandIndex %d on applyCh", cmd.CommandIndex))
 			}
-			switch cmd.Command.(type) {
-			case Op:
-				op := cmd.Command.(Op)
-				switch op.Op {
-				case Nop: // do nothing
-				case ConfigChange:
-					kv.DPrintf("[%d][%d] Config Change [%d] Config: %+v", kv.gid, kv.me, cmd.CommandIndex, *op.NewConfig)
-					kv.handleConfigChange(op)
-				case InstallShard:
-					kv.DPrintf("[%d][%d] Install Shard [%d] Shard: %d", kv.gid, kv.me, cmd.CommandIndex, op.ShardArgs.Shard)
-					kv.handleInstallShard(op)
-					if op.From == kv.me && op.ResultCh != nil {
-						op.ResultCh <- Result{Valid: true, Value: ""}
-					}
-				default:
-					kv.DPrintf("[%d][%d] Apply command [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
-					cfg := kv.config.Load()
-					shard := key2shard(op.Key)
-					// do not apply operation if not owing the shard or waiting to receive this shard
-					// then the client request will fail and it will finally retry
-					_, shardNotReady := kv.shardsToRecv[shard]
-					// it is tricky here that if we update the dedup stable status, we should also increase the seqNumber once client received ErrWrongGroup
-					// we have to choose to do both or neither, otherwise the previous failed request won't be properly retried once we're ready to serve this shard
-					if cfg.Shards[shard] != kv.gid || shardNotReady {
-						if op.From == kv.me && op.ResultCh != nil {
-							kv.DPrintf("[%d][%d] Apply failed [%d] [%+v]", kv.gid, kv.me, cmd.CommandIndex, op)
-							op.ResultCh <- Result{Valid: false}
-						}
-					} else {
-						result := kv.applyOperation(op)
-						// only notify completion when request waiting on same server and channel available
-						// we also need to ensure `ResultCh` is not nil, because if server restarts before this entry committed
-						// log will be reloaded from persistent state and channel will be set to nil since it's non-serializable
-						// if the source server happened to become leader again to commit this entry, it will pass first check and cause dead lock in Raft
-						if op.From == kv.me && op.ResultCh != nil {
-							op.ResultCh <- Result{Valid: true, Value: result}
-						}
-					}
-				}
-			case TxnCmd:
-				kv.applyTxnOperation(cmd.Command.(TxnCmd))
-			default:
-				panic("unknown command type")
+			kv.failConflictPendingRequests(cmd)
+			if cmd.CommandIndex <= kv.getLastAppliedIndex() {
+				panic(fmt.Sprintf("unexpected CommandIndex %d <= lastAppliedIndex %d", cmd.CommandIndex, kv.getLastAppliedIndex()))
 			}
 
+			kv.handleCommandApply(&cmd)
 			// we can only update the last applied index after we successfully apply the operation
-			if cmd.CommandIndex != -1 {
-				kv.lastAppliedIndex = cmd.CommandIndex
-			}
+			kv.setLastAppliedIndex(cmd.CommandIndex)
 			// and then we can persist the states
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
-				if cmd.CommandIndex != -1 {
-					kv.doSnapshot(cmd.CommandIndex)
-				} else {
-					kv.doSnapshot(kv.lastAppliedIndex)
-				}
+				kv.doSnapshot(cmd.CommandIndex)
 			}
-		case killed := <-kv.killCh:
-			if killed {
-				return
-			}
+		case req := <-kv.executeCh:
+			kv.handleExecute(req)
+		case <-kv.killCh:
+			return
 		}
 	}
 }
@@ -1159,7 +1415,7 @@ func (kv *ShardKV) daemonPendingTxnResolver() {
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(PendingTxnScanInterval)
 	}
 }
 
@@ -1167,7 +1423,7 @@ func (kv *ShardKV) doSnapshot(index int) {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
 
-	if err := e.Encode(kv.lastAppliedIndex); err != nil {
+	if err := e.Encode(kv.getLastAppliedIndex()); err != nil {
 		log.Fatal(err)
 	}
 	// config MUST be persisted, otherwise we'll have to apply all historical configs before able to serve
@@ -1263,8 +1519,8 @@ func (kv *ShardKV) reloadFromSnapshot(data []byte) {
 	kv.rwLock.Lock()
 	kv.state = state
 	kv.dedup = dedupTable
-	kv.lastAppliedIndex = lastAppliedIndex
 	kv.rwLock.Unlock()
+	kv.setLastAppliedIndex(lastAppliedIndex)
 	kv.txnStateLock.Lock()
 	kv.txnStateMap = txnStateMap
 	kv.txnReadSet = txnReadSet
@@ -1281,12 +1537,23 @@ func (kv *ShardKV) reloadFromSnapshot(data []byte) {
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
 func (kv *ShardKV) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
-	kv.rf.Kill()
-	kv.killCh <- true
+	if !atomic.CompareAndSwapInt32(&kv.dead, 0, 1) {
+		return
+	}
+	close(kv.killCh)
 	kv.condSendShards.Broadcast()
-	kv.mck.Kill()
+	kv.applyMu.Lock()
+	kv.notifyCommandApplyLocked()
+	kv.applyMu.Unlock()
+	kv.followerReadMu.Lock()
+	followerReads := kv.flushFollowerReadBatchLocked()
+	kv.followerReadMu.Unlock()
+	for _, req := range followerReads {
+		SafeWriteChannel(req.ResultCh, GetReply{Err: kvraft.ErrKilled})
+	}
 	kv.failAllPendingRequests(kvraft.ErrKilled)
+	kv.mck.Kill()
+	kv.rf.Kill()
 	raft.CheckKillFinish(10, func() bool { return kv.checkKillComplete() }, kv)
 }
 
@@ -1344,19 +1611,23 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persister = persister
 	kv.lastAppliedIndex = 0
 	kv.make_end = make_end
+	kv.servers = servers
 	kv.gid = gid
 	kv.ctrlers = ctrlers
 
 	// Use something like this to talk to the shardctrler:
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.killCh = make(chan bool, 10)
+	kv.applyCh = make(chan raft.ApplyMsg, 128)
+	kv.executeCh = make(chan any, 128)
+	kv.killCh = make(chan struct{})
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	atomic.StoreInt32(&kv.rf.GID, int32(kv.gid))
 	// KV server states
 	kv.state = make(map[string]string)
 	kv.dedup = make(map[DedupKey]DedupEntry)
 	kv.pendingRequests = make(map[int]kvraft.RequestInfo)
+	kv.applyNotifyCh = make(chan struct{})
+	kv.lastLeaderIndex.Store(int32(kv.me))
 	kv.txnStateMap = make(map[string]*TxnState)
 	kv.txnReadSet = make(map[string]map[string]struct{})
 	kv.txnWriteSet = make(map[string]map[string]struct{})
@@ -1373,7 +1644,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.clientId = nrand()
 	kv.seqCounter.Store(0)
 	go kv.daemonSendShard()
-	go kv.stateMachineExecutor()
+	go kv.stateMachineThread()
 	go kv.daemonConfigFetcher()
 	go kv.daemonPendingTxnResolver()
 	return kv

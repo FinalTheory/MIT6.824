@@ -18,11 +18,13 @@ package raft
 //
 
 import (
-	"6.5840/labgob"
 	"bytes"
 	"fmt"
 	"log"
 	"runtime"
+
+	"6.5840/labgob"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -102,6 +104,20 @@ const (
 
 // use -1 to represent null
 const Null = -1
+
+const (
+	DebugLockRetryInterval     = 100 * time.Millisecond
+	AppendEntriesRetryInterval = 10 * time.Millisecond
+	TickerInterval             = 10 * time.Millisecond
+	HeartbeatInterval          = 100 * time.Millisecond
+	HeartbeatAckTimeout        = 3 * time.Second
+	LeaderLeaseDuration        = 300 * time.Millisecond
+
+	ElectionTimeoutMinMillis   int64 = 400
+	ElectionTimeoutRangeMillis int64 = 400
+
+	RaftKillWaitTimeoutSeconds int64 = 10
+)
 
 func (r Role) String() string {
 	switch r {
@@ -272,19 +288,20 @@ type Raft struct {
 	log      LogContainer
 	snapshot []byte
 
-	serverStartTime int64
-	nextTimeout     int64
-	sleepTo         int64
+	serverStartTime  int64
+	nextTimeout      int64
+	heartbeatSleepTo atomic.Int64
+	heartbeatWakeCh  chan struct{}
+	leaderLeaseUntil atomic.Int64
 
 	msgQueue []ApplyMsg
 
 	// states used to kill raft service
 	tickerKilled    atomic.Bool
 	heartbeatKilled atomic.Bool
-	daemonKilled    []atomic.Bool
+	logDaemonKilled []atomic.Bool
 	applierKilled   atomic.Bool
-	killCh          chan bool
-	killChSize      int
+	killCh          chan struct{}
 }
 
 func (rf *Raft) DebugLock() {
@@ -292,7 +309,7 @@ func (rf *Raft) DebugLock() {
 		owner := rf.lockOwner.Load()
 		if owner != nil {
 			log.Printf("[%d][%d] Failed to acquire lock hold by %s", rf.getGID(), rf.me, *owner)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(DebugLockRetryInterval)
 		}
 	}
 }
@@ -318,6 +335,31 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
+func (rf *Raft) LeaseReadIndex() int {
+	rf.Lock()
+	defer rf.Unlock()
+
+	if rf.role != Leader || rf.killed() {
+		return -1
+	}
+	if time.Now().UnixMilli() >= rf.leaderLeaseUntil.Load() {
+		rf.wakeHeartbeat()
+		return -1
+	}
+	if rf.commitIndex < 0 || rf.log.TermAt(rf.commitIndex) != rf.currentTerm {
+		return -1
+	}
+	return rf.commitIndex + 1
+}
+
+func (rf *Raft) wakeHeartbeat() {
+	rf.heartbeatSleepTo.Store(time.Now().UnixMilli())
+	select {
+	case rf.heartbeatWakeCh <- struct{}{}:
+	default:
+	}
+}
+
 func (rf *Raft) GetTraceState() map[string]any {
 	return merge(rf.log.GetTraceState(), map[string]any{
 		"GID":              rf.getGID(),
@@ -325,6 +367,7 @@ func (rf *Raft) GetTraceState() map[string]any {
 		"raft.commitIndex": rf.commitIndex,
 		"raft.lastApplied": rf.lastApplied,
 		"raft.nextIndex":   fmt.Sprintf("%v", rf.nextIndex),
+		"raft.leaseUntil":  rf.leaderLeaseUntil.Load(),
 	})
 }
 
@@ -435,6 +478,12 @@ type AppendEntriesReply struct {
 	Term                int
 	Success             bool
 	XTerm, XIndex, XLen int
+}
+
+type AppendEntriesAck struct {
+	Server   int
+	Term     int
+	Accepted bool
 }
 
 type LastLogInfo struct {
@@ -749,18 +798,18 @@ func (rf *Raft) shouldSendEntriesToServerLocked(server int, isHeartBeat bool) bo
 }
 
 func (rf *Raft) sendLogDaemon(server int) {
+	defer rf.logDaemonKilled[server].Store(true)
 	for !rf.killed() {
 		rf.Lock()
 		for !rf.shouldSendEntriesToServerLocked(server, false) && !rf.killed() {
 			rf.condAppendEntries.Wait()
 		}
 		rf.Unlock()
-		rf.sendLogEntriesToServer(server, false)
+		rf.sendLogEntriesToServer(server, false, nil)
 	}
-	rf.daemonKilled[server].Store(true)
 }
 
-func (rf *Raft) sendLogEntriesToServer(server int, isHeartBeat bool) {
+func (rf *Raft) sendLogEntriesToServer(server int, isHeartBeat bool, ackCh chan<- AppendEntriesAck) {
 	for {
 		sendSnapshot := false
 		var copiedEntries []LogEntry = nil
@@ -802,20 +851,27 @@ func (rf *Raft) sendLogEntriesToServer(server int, isHeartBeat bool) {
 				break
 			} else {
 				// sleep for a while if RPC failed
-				time.Sleep(time.Millisecond * 10)
+				time.Sleep(AppendEntriesRetryInterval)
 			}
 		} else {
-			if rf.sendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex) || isHeartBeat || rf.killed() {
+			if rf.sendLogEntriesOnce(server, term, commitIndex, copiedEntries, nextIndex-1, prevLogTerm, nextIndex, ackCh) || isHeartBeat || rf.killed() {
 				break
 			} else {
 				// sleep for a while if RPC failed
-				time.Sleep(time.Millisecond * 10)
+				time.Sleep(AppendEntriesRetryInterval)
 			}
 		}
 	}
 }
 
-func (rf *Raft) sendLogEntriesOnce(server int, term int, commitIndex int, entries []LogEntry, prevLogIndex int, prevLogTerm int, nextIndex int) bool {
+func (rf *Raft) sendLogEntriesOnce(server int, term int, commitIndex int, entries []LogEntry, prevLogIndex int, prevLogTerm int, nextIndex int, ackCh chan<- AppendEntriesAck) bool {
+	accepted := false
+	defer func() {
+		if ackCh != nil {
+			ackCh <- AppendEntriesAck{Server: server, Term: term, Accepted: accepted}
+		}
+	}()
+
 	reply := AppendEntriesReply{}
 	args := AppendEntriesArgs{
 		Term:         term,
@@ -840,6 +896,7 @@ func (rf *Raft) sendLogEntriesOnce(server int, term int, commitIndex int, entrie
 	}
 
 	if reply.Success {
+		accepted = rf.role == Leader && rf.currentTerm == args.Term
 		rf.nextIndex[server] = max(nextIndex+len(entries), rf.nextIndex[server])
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
 	} else {
@@ -993,7 +1050,7 @@ func (rf *Raft) checkKillComplete() bool {
 		return false
 	}
 	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me && !rf.daemonKilled[i].Load() {
+		if i != rf.me && !rf.logDaemonKilled[i].Load() {
 			return false
 		}
 	}
@@ -1010,13 +1067,13 @@ func (rf *Raft) checkKillComplete() bool {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
+	if !atomic.CompareAndSwapInt32(&rf.dead, 0, 1) {
+		return
+	}
+	close(rf.killCh)
 	rf.condAppendEntries.Broadcast()
 	rf.condApplyMsg.Broadcast()
-	for i := 0; i < rf.killChSize; i += 1 {
-		rf.killCh <- true
-	}
-	CheckKillFinish(10, func() bool { return rf.checkKillComplete() }, rf)
+	CheckKillFinish(RaftKillWaitTimeoutSeconds, func() bool { return rf.checkKillComplete() }, rf)
 }
 
 func (rf *Raft) killed() bool {
@@ -1029,26 +1086,24 @@ func (rf *Raft) getGID() int {
 }
 
 func (rf *Raft) resetElectionTimeout() {
-	// pause for a random amount of time between 200 and 400
-	// milliseconds.
-	timeout := 400 + (rand.Int63() % 400)
+	timeout := ElectionTimeoutMinMillis + (rand.Int63() % ElectionTimeoutRangeMillis)
 	atomic.StoreInt64(&rf.nextTimeout, time.Now().UnixMilli()+timeout)
 }
 
 func (rf *Raft) ticker() {
+	defer rf.tickerKilled.Store(true)
 	for rf.killed() == false {
 		// only used for once
 		if rf.serverStartTime != 0 {
 			TraceEventBegin(true, "Follower", rf.me, rf.getGID(), rf.serverStartTime, nil)
 			rf.serverStartTime = 0
 		}
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(TickerInterval)
 		if time.Now().UnixMilli() > atomic.LoadInt64(&rf.nextTimeout) {
 			rf.resetElectionTimeout()
 			rf.startNewElection()
 		}
 	}
-	rf.tickerKilled.Store(true)
 }
 
 func (rf *Raft) startNewElection() {
@@ -1122,6 +1177,7 @@ func (rf *Raft) switchToCandidate() {
 	rf.role = Candidate
 	rf.voteCount = 1
 	rf.votedFor = rf.me
+	rf.leaderLeaseUntil.Store(0)
 	rf.persist()
 }
 
@@ -1139,6 +1195,7 @@ func (rf *Raft) switchToFollower() {
 	rf.role = Follower
 	rf.voteCount = 0
 	rf.votedFor = Null
+	rf.leaderLeaseUntil.Store(0)
 	rf.persist()
 }
 
@@ -1155,30 +1212,72 @@ func (rf *Raft) switchToLeader() {
 	TraceEventBegin(!rf.killed(), Leader.String(), rf.me, rf.getGID(), now, state)
 	rf.role = Leader
 	rf.voteCount = 0
+	rf.leaderLeaseUntil.Store(0)
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.log.Length()
 		rf.matchIndex[i] = -1
 	}
-	rf.heartbeatImpl()
+	rf.wakeHeartbeat()
 }
 
 func (rf *Raft) heartbeat() {
-	for rf.killed() == false {
-		for time.Now().UnixMilli() < rf.sleepTo {
-			time.Sleep(time.Millisecond * 10)
+	defer rf.heartbeatKilled.Store(true)
+	for !rf.killed() {
+		select {
+		case <-time.After(TickerInterval):
+		case <-rf.heartbeatWakeCh:
+		case <-rf.killCh:
+			return
 		}
-		rf.sleepTo = time.Now().UnixMilli() + 100
-		if _, isLeader := rf.GetState(); isLeader {
-			rf.heartbeatImpl()
+		now := time.Now()
+		if now.UnixMilli() < rf.heartbeatSleepTo.Load() {
+			continue
+		}
+		rf.heartbeatSleepTo.Store(now.Add(HeartbeatInterval).UnixMilli())
+		if term, isLeader := rf.GetState(); isLeader {
+			rf.heartbeatImpl(term)
 		}
 	}
-	rf.heartbeatKilled.Store(true)
 }
 
-func (rf *Raft) heartbeatImpl() {
+func (rf *Raft) heartbeatImpl(term int) {
+	sendTime := time.Now()
+	ackCh := make(chan AppendEntriesAck, len(rf.peers)-1)
 	for i := 0; i < len(rf.peers); i += 1 {
 		if i != rf.me {
-			go rf.sendLogEntriesToServer(i, true)
+			go rf.sendLogEntriesToServer(i, true, ackCh)
+		}
+	}
+	go rf.refreshLeaderLeaseOnMajorityAck(term, sendTime, ackCh)
+}
+
+func (rf *Raft) refreshLeaderLeaseOnMajorityAck(term int, sendTime time.Time, ackCh <-chan AppendEntriesAck) {
+	timer := time.NewTimer(HeartbeatAckTimeout)
+	defer timer.Stop()
+
+	ackCount := 1
+	for ackCount < rf.majorityNum() {
+		select {
+		case ack := <-ackCh:
+			if ack.Term == term && ack.Accepted {
+				ackCount += 1
+			}
+		case <-timer.C:
+			return
+		}
+	}
+	rf.refreshLeaderLeaseUntil(sendTime)
+}
+
+func (rf *Raft) refreshLeaderLeaseUntil(sendTime time.Time) {
+	leaseUntil := sendTime.Add(LeaderLeaseDuration).UnixMilli()
+	for {
+		old := rf.leaderLeaseUntil.Load()
+		if leaseUntil <= old {
+			return
+		}
+		if rf.leaderLeaseUntil.CompareAndSwap(old, leaseUntil) {
+			return
 		}
 	}
 }
@@ -1221,9 +1320,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.serverStartTime = time.Now().UnixMicro()
 	rf.applyCh = &applyCh
-	// in case Kill() is called more than once or more goroutines needs to be terminated
-	rf.killChSize = 16
-	rf.killCh = make(chan bool, rf.killChSize)
+	rf.killCh = make(chan struct{})
+	rf.heartbeatWakeCh = make(chan struct{}, 1)
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
@@ -1237,12 +1335,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = Null
 	rf.condAppendEntries = sync.NewCond(&rf.mu)
 	rf.condApplyMsg = sync.NewCond(&rf.mu)
+	rf.heartbeatSleepTo.Store(time.Now().Add(HeartbeatInterval).UnixMilli())
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	rf.daemonKilled = make([]atomic.Bool, len(rf.peers))
+	rf.logDaemonKilled = make([]atomic.Bool, len(rf.peers))
 	for i := 0; i < len(rf.peers); i += 1 {
 		rf.nextIndex[i] = 0
 		rf.matchIndex[i] = -1

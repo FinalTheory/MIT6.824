@@ -43,14 +43,15 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm         *shardctrler.Clerk
-	config     shardctrler.Config
-	make_end   func(string) *labrpc.ClientEnd
-	clientId   int64
+	sm       *shardctrler.Clerk
+	config   shardctrler.Config
+	make_end func(string) *labrpc.ClientEnd
+	clientId int64
 	// Requests from the same clerk are ordered by seqCounter for dedup.
 	// A clerk is therefore expected to be used serially; concurrent reuse
 	// can cause older requests to become stale permanently.
 	seqCounter atomic.Int32
+	lastLeader atomic.Int32
 }
 
 func (ck *Clerk) Kill() {
@@ -70,6 +71,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.make_end = make_end
 	ck.clientId = nrand()
 	ck.seqCounter.Store(0)
+	ck.lastLeader.Store(0)
 	return ck
 }
 
@@ -78,6 +80,14 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
+	return ck.getImpl(key, "ShardKV.Get")
+}
+
+func (ck *Clerk) GetV1(key string) string {
+	return ck.getImpl(key, "ShardKV.GetV1")
+}
+
+func (ck *Clerk) getImpl(key string, method string) string {
 	args := GetArgs{
 		Key:       key,
 		ClientId:  ck.clientId,
@@ -89,11 +99,14 @@ func (ck *Clerk) Get(key string) string {
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
+			start := int(ck.lastLeader.Load())
+			for offset := 0; offset < len(servers); offset++ {
+				si := (start + offset) % len(servers)
 				srv := ck.make_end(servers[si])
 				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
+				ok := srv.Call(method, &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.lastLeader.Store(int32(si))
 					return reply.Value
 				}
 				if ok && reply.Err == kvraft.ErrStaleRequest {
@@ -105,7 +118,7 @@ func (ck *Clerk) Get(key string) string {
 				// ... not ok, or ErrWrongLeader
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(ClerkRetryInterval)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
@@ -128,11 +141,14 @@ func (ck *Clerk) PutAppend(key string, value string, op kvraft.OpType) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
+			start := int(ck.lastLeader.Load())
+			for offset := 0; offset < len(servers); offset++ {
+				si := (start + offset) % len(servers)
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					ck.lastLeader.Store(int32(si))
 					return
 				}
 				if ok && reply.Err == kvraft.ErrStaleRequest {
@@ -144,7 +160,7 @@ func (ck *Clerk) PutAppend(key string, value string, op kvraft.OpType) {
 				// ... not ok, or ErrWrongLeader
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(ClerkRetryInterval)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}

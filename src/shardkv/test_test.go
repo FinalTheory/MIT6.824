@@ -1,15 +1,18 @@
 package shardkv
 
-import "6.5840/porcupine"
-import "6.5840/models"
-import "testing"
-import "strconv"
-import "time"
-import "fmt"
-import "sync/atomic"
-import "sync"
-import "math/rand"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"6.5840/models"
+	"6.5840/porcupine"
+)
 
 const linearizabilityCheckTimeout = 1 * time.Second
 
@@ -935,4 +938,173 @@ func TestChallenge2Partial(t *testing.T) {
 	}
 
 	fmt.Printf("  ... Passed\n")
+}
+
+func findGroupLeader(t *testing.T, cfg *config, gi int) int {
+	leader := -1
+	for start := time.Now(); time.Since(start) < 3*time.Second; {
+		for i, kv := range cfg.groups[gi].servers {
+			if kv == nil {
+				continue
+			}
+			if _, isLeader := kv.rf.GetState(); isLeader {
+				leader = i
+				break
+			}
+		}
+		if leader >= 0 {
+			return leader
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no leader found")
+	return -1
+}
+
+func makeTestClerks(cfg *config, workers int) []*Clerk {
+	clerks := make([]*Clerk, workers)
+	for i := 0; i < workers; i++ {
+		clerks[i] = cfg.makeClient()
+		clerks[i].config = cfg.mck.Query(-1)
+	}
+	return clerks
+}
+
+func runConcurrentGets(t *testing.T, cfg *config, clerks []*Clerk, startIndex int32, key, value, method string, rounds int) (time.Duration, int) {
+	errCh := make(chan string, len(clerks))
+	beforeCount := cfg.net.GetTotalCount()
+	startTime := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(len(clerks))
+	for i := range clerks {
+		go func(ck *Clerk) {
+			defer wg.Done()
+			for round := 0; round < rounds; round++ {
+				ck.lastLeader.Store(startIndex)
+				var got string
+				if method == "Get" {
+					got = ck.Get(key)
+				} else {
+					got = ck.GetV1(key)
+				}
+				if got != value {
+					errCh <- fmt.Sprintf("%s(%v): expected %v got %v", method, key, value, got)
+					return
+				}
+			}
+		}(clerks[i])
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != "" {
+			t.Fatal(err)
+		}
+	}
+	return time.Since(startTime), cfg.net.GetTotalCount() - beforeCount
+}
+
+func runLeaseReadRPCComparison(t *testing.T, banner string, startOnLeader bool) {
+	fmt.Printf(banner)
+
+	cfg := make_config(t, 3, false, -1)
+	defer cfg.cleanup()
+
+	ck := cfg.makeClient()
+	cfg.join(0)
+	key := "lease-read-rpc-key"
+	value := "lease-read-rpc-value"
+	ck.Put(key, value)
+	check(t, ck, key, value)
+
+	leaderIndex := findGroupLeader(t, cfg, 0)
+	startIndex := leaderIndex
+	if !startOnLeader {
+		startIndex = (leaderIndex + 1) % cfg.n
+	}
+
+	// Warm the leader lease/current-term commit once so the measurement
+	// focuses on steady-state behavior rather than first-use setup.
+	ck.lastLeader.Store(int32(leaderIndex))
+	if got := ck.Get(key); got != value {
+		t.Fatalf("warm optimized Get(%v): expected %v got %v", key, value, got)
+	}
+	time.Sleep(2 * FollowerReadBatchWait)
+
+	const workers = 8
+	const rounds = 50
+
+	optimizedClerks := makeTestClerks(cfg, workers)
+	defer func() {
+		for _, clerk := range optimizedClerks {
+			cfg.deleteClient(clerk)
+		}
+	}()
+	optimizedDuration, optimizedRPCs := runConcurrentGets(t, cfg, optimizedClerks, int32(startIndex), key, value, "Get", rounds)
+
+	legacyClerks := makeTestClerks(cfg, workers)
+	defer func() {
+		for _, clerk := range legacyClerks {
+			cfg.deleteClient(clerk)
+		}
+	}()
+	legacyDuration, legacyRPCs := runConcurrentGets(t, cfg, legacyClerks, int32(startIndex), key, value, "GetV1", rounds)
+
+	if optimizedRPCs >= legacyRPCs {
+		t.Fatalf("lease read did not reduce RPCs: optimized=%d legacy=%d", optimizedRPCs, legacyRPCs)
+	}
+	if optimizedDuration >= legacyDuration {
+		t.Fatalf("lease read was not faster: optimized=%v legacy=%v", optimizedDuration, legacyDuration)
+	}
+
+	fmt.Printf("  ... Passed; optimized RPCs %d, legacy RPCs %d, optimized time %v, legacy time %v\n",
+		optimizedRPCs, legacyRPCs, optimizedDuration, legacyDuration)
+}
+
+func TestLeaseReadOnFollower(t *testing.T) {
+	runLeaseReadRPCComparison(t, "Test: lease read on follower uses fewer RPCs than legacy Get ...\n", false)
+}
+
+func TestLeaseReadOnLeader(t *testing.T) {
+	runLeaseReadRPCComparison(t, "Test: lease read on leader uses fewer RPCs than legacy Get ...\n", true)
+}
+
+func TestLeaseReadAfterElection(t *testing.T) {
+	fmt.Printf("Test: lease read recovers after leader switch ...\n")
+
+	cfg := make_config(t, 3, false, -1)
+	defer cfg.cleanup()
+
+	cfg.join(0)
+	ck := cfg.makeClient()
+	key := "lease-switch-key"
+	value := "lease-switch-value"
+	ck.Put(key, value)
+	check(t, ck, key, value)
+
+	oldLeader := findGroupLeader(t, cfg, 0)
+	ck.lastLeader.Store(int32(oldLeader))
+	if got := ck.Get(key); got != value {
+		t.Fatalf("warm leader Get(%v): expected %v got %v", key, value, got)
+	}
+
+	cfg.ShutdownServer(0, oldLeader)
+	newLeader := findGroupLeader(t, cfg, 0)
+	newLeaderKV := cfg.groups[0].servers[newLeader]
+	if newLeaderKV.rf.LeaseReadIndex() > 0 {
+		t.Fatalf("new leader %d unexpectedly had a ready lease read index immediately after term switch", newLeader)
+	}
+
+	firstDuration, firstRPCs := runConcurrentGets(t, cfg, []*Clerk{ck}, int32(newLeader), key, value, "Get", 1)
+	secondDuration, secondRPCs := runConcurrentGets(t, cfg, []*Clerk{ck}, int32(newLeader), key, value, "Get", 1)
+
+	if secondRPCs >= firstRPCs {
+		t.Fatalf("first read after leader switch was not more expensive than steady-state read: firstRPCs=%d secondRPCs=%d", firstRPCs, secondRPCs)
+	}
+	if newLeaderKV.rf.LeaseReadIndex() <= 0 {
+		t.Fatalf("new leader %d did not establish lease read after recovery", newLeader)
+	}
+
+	fmt.Printf("  ... Passed; first read RPCs %d, second read RPCs %d, first time %v, second time %v\n",
+		firstRPCs, secondRPCs, firstDuration, secondDuration)
 }
